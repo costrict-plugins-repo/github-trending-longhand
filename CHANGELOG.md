@@ -1,0 +1,1071 @@
+# Changelog
+
+All notable changes to Longhand are documented here. The format is loosely
+based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+For pre-v0.6 releases, the canonical record is the annotated git tag —
+`git show v0.5.13` etc. Entries below are reverse-engineered from the
+commits and tag annotations of those releases.
+
+---
+
+## [1.3.0] — 2026-10-30
+
+Opt-in backup of the archive to a git remote you own, and restore from it.
+Nothing leaves the machine until `backup init` has shown the consent
+screen and you have typed `yes`.
+
+### Added
+
+- **`longhand backup init --remote <url>`** validates the remote (https, ssh,
+  scp-like, file, or an absolute path; a leading `-` or any `::` transport
+  helper is refused), refuses a public or organization-internal GitHub
+  repository (checked through `gh`; `--create` makes it private first),
+  measures the archive, prints what would be uploaded, and enables backups
+  only after you type `yes` (plus `private` when the remote cannot be
+  verified). `--yes` for scripts; without a terminal it refuses.
+- **`longhand backup`** exports every changed session as its verbatim
+  transcript (one line per distinct stored line, 40 MB parts), with every
+  `longhand redact` pattern masked in the copy only, commits in 500 MB
+  batches and pushes. A session in the repository never shrinks: two
+  machines' copies are merged as a union. `--dry-run`, `--no-push`, and
+  `--no-mask` (needs a terminal and the typed word `verbatim`).
+- **`longhand backup status`**, **`backup auto on|off`** (the scheduled
+  `reconcile --fix` pushes at most hourly, only when something changed,
+  masking always on, failures to `logs/backup.log`), **`backup disable`**.
+- **`longhand restore [--from <url>|<path>] [--skip-analysis]`** clones the
+  backup and re-parses every transcript with the current parser into the
+  store under the ingest lock; sessions already present are skipped by
+  content hash, one broken session never aborts the rest, and `config.json`
+  is restored only when the data dir has none.
+- `backup.*` keys in `config.json` (`longhand config --set backup.auto=true`)
+  and a `Backup` row in `longhand doctor`.
+- [docs/backup.md](docs/backup.md).
+
+### Changed
+
+- README principle 8 ("Local or nothing") now discloses the second, opt-in
+  exception beside the version check; SECURITY.md lists the third
+  `subprocess` call site (`longhand/backup/gitrepo.py`, argv-only with
+  `protocol.ext.allow=never`) and the new paths under `~/.longhand/`.
+- README and the repo docs got an accuracy pass against 1.2.3 (#109); the
+  runtime-command surface check reads package sources as UTF-8 so it passes
+  on Windows (#111).
+
+## [1.2.3] — 2026-09-27
+
+Six user-facing bugs, found by checking every claim in the docs against the
+code. None changes stored data.
+
+### Fixed
+
+- **`get_session_timeline` with `tail` returned the middle of long sessions.**
+  It read the first 5,000 events in ascending order and sliced their end, so
+  on a longer session "how did it end" came back with events from the middle.
+  It now reads newest-first under the same cap and returns them in ascending
+  order. One session in the author's archive has 8,240 events.
+- **`setup` suggested a command that no longer exists.** Its closing hint was
+  `longhand recap --days 7`, removed at 1.0. It now suggests `longhand status
+  --days 7`, the documented successor.
+- **`setup` said it installed the MCP server "for Claude Code".**
+  `longhand mcp install` writes Claude Desktop's config only. The step now
+  says Claude Desktop, and prints the command that registers Longhand with
+  Claude Code (`claude mcp add longhand -s user -- longhand mcp-server`), the
+  same one `doctor` recommends.
+- **Recall and a tool description pointed Claude at a retired tool.** Recall's
+  three narrative footers and `get_session_timeline`'s description said to
+  use `search_in_context`, retired at 1.0. They now name `search` with
+  `session_id` and `context_events`.
+- **The `reconcile` tool's schema said `fix` defaults to true.** The handler
+  has defaulted to a dry run since 1.0. The schema now agrees, so an agent
+  that omits `fix` knows it gets a report, not a repair.
+- **`--skip-analysis` claimed to populate "SQLite only".** Events are always
+  stored and embedded; the flag skips the analysis pass (episodes, segments,
+  and session/project vectors). The `setup` and `ingest` help now says so.
+
+### Internal
+
+- Three new checks guard the text the program shows at runtime, the way the
+  README checks guard the docs: every `longhand <command>` it suggests must be
+  a registered command, and no tool description or recall footer may send
+  Claude to a retired tool.
+- The deeper findings from the same audit are filed as #96–#107.
+
+---
+
+## [1.2.2] — 2026-09-27
+
+Recall now says when its best match is much older than the alternatives, a
+Codex record no longer trips the doctor's format-drift warning, and CI stops
+crashing on Python 3.13.
+
+### Added
+
+- **Recall flags an old best match instead of letting it read as current
+  (#82).** Recency is worth at most 0.5 points in episode ranking against 10
+  per keyword hit, so an old episode can outrank fresh work on the same topic.
+  Re-weighting would break "what did I do last year", so nothing is reordered.
+  When a query carries no time phrase and the top episode is at least 30 days
+  old and at least 30 days older than the newest runner-up, recall says so
+  before the answer: *"The best match is from 6 months ago, but newer related
+  work exists from 2 months ago. If you meant current work, add a time phrase
+  like "this week" or "this month"."* It leads the narrative (MCP `recall`,
+  `longhand recall`, the demo), appears in the UserPromptSubmit hook's
+  injected context, and is on `RecallResult.age_gap_note` for programmatic
+  callers. Measured before shipping at 792 sessions: 6 of the 8 `recall_diff`
+  queries had shifted since the August baseline, most toward newer sessions;
+  the note fires on 3 of the 8.
+
+### Fixed
+
+- **`longhand doctor` reported "the transcript format has drifted" for a Codex
+  `compacted` record.** Codex writes one when it compacts a thread's context
+  window. Its `replacement_history` re-lists messages the rollout already
+  carries (26 of 27 on the live record), plus injected developer context and
+  an encrypted item. It is now skipped, like `token_usage_record` and
+  `world_state`, and the drift row treats Codex skip types stored before their
+  skip existed as understood — the rule it already applied to Claude types.
+- **`scripts/recall_diff.py` always printed "0 queries changed".** It counted
+  changed queries by re-parsing its own output, whose headers begin with a
+  newline, so the count matched nothing. It now counts directly and prints
+  the denominator ("6 of 8").
+
+### Internal
+
+- **CI's Python 3.13 leg crashed with `Illegal instruction` on some runners.**
+  `chroma-hnswlib` 0.7.6 has no cp313/cp314 wheel, so pip builds it with
+  `-march=native`, and the pip cache restored that CPU-specific build onto
+  runners with a different CPU. Builds are now portable
+  (`HNSWLIB_NO_NATIVE=1`), and cached hnswlib wheels are evicted before
+  install. A local install builds hnswlib for the machine it runs on, so
+  this was a CI problem, not a user-facing one.
+- The retired fieldnotes notes moved to `docs/fieldnotes-archive/`, and the
+  `.fieldnotes/` machinery is gone.
+
+---
+
+## [1.2.1] — 2026-09-17
+
+Three MCP-path fixes. The `longhand timeline` CLI reads `get_events` directly
+and was never affected by any of them.
+
+### Fixed
+
+- **`get_session_timeline` ignored `limit` and `offset` and always returned
+  exactly one event.** The handler used `0` as its "no tail requested"
+  sentinel, but read it through `_limit()`, which floors at `1` — a floor
+  added in `bad2f17` (2026-06-09) to stop a negative value reaching SQLite as
+  the unbounded `LIMIT -1`. The sentinel clamped to `1`, so every call took
+  the tail branch, `offset`/`limit` were never read, and the response carried
+  `"tail": 1` for a caller who never asked to tail. Passing `tail` explicitly
+  always worked, which is why this survived: the existing tests asserted the
+  shape of the payload but never counted the events in it. Shipped in v1.0
+  through v1.2. A new `_tail()` coercion keeps `0` distinct from `1`;
+  `_limit()` is unchanged, its floor being correct for every real limit.
+- **The shared server's `get_session_timeline` interleaved subagent threads.**
+  Subagent (sidechain) transcripts are stored under the *parent*
+  `session_id`, each restarting its own `sequence` at 0, so `ORDER BY
+  sequence` mixed several independent threads together and read as though
+  rows from different sessions had leaked into one. It now orders by
+  timestamp with sequence as the tiebreak, hides the parser's `#`-suffixed
+  collision duplicates (matching `get_events`' `dedup_suffixes`), and returns
+  `is_sidechain` so a reader can tell a subagent row from a parent one.
+- **`search` let a fuzzy project guess override an explicit `session_id`.**
+  Auto-scoping checked only `project_id`/`project_name`, so a query whose
+  *text* resembled some project name layered that project on top of the
+  session filter and intersected to nothing — returning zero hits with a hint
+  blaming project scope. An explicit `session_id` now suppresses auto-scope
+  entirely; pass `project_id`/`project_name` to combine them deliberately.
+
+---
+
+## [1.2.0] — 2026-09-07
+
+### Added
+
+- **The Codex finalizer.** Codex threads now get the full pipeline —
+  embeddings, episodes, project inference — on their own, 30 minutes after
+  the rollout goes quiet. It is the Codex twin of Claude Code's SessionEnd
+  hook: Codex sends no session-end signal, so quiet stands in for it. Until
+  now an active thread that had been indexed with `--semantic` regressed to
+  exact-record-only the moment it grew, and nothing ever indexed it again.
+  `longhand codex-sync` runs the finalizer after its exact-record pass
+  (`--finalize-after SECONDS` to tune the bound, `--no-finalize` to opt out),
+  one thread per run so the every-minute poller stays bounded; `reconcile
+  --fix` clears the whole quiet backlog. The embedding model loads only on a
+  run that has a quiet thread to finalize. A finalized thread that resumes is
+  captured exact-only again and finalized again once it settles — one
+  re-embed per resume, never a treadmill.
+- `longhand.codex.finalize_codex()`, a `settling` bucket and
+  `min_idle_seconds` on `scan_codex_sessions()` / `sync_codex()`, and
+  `codex_unfinalized` / `codex_settling` / `codex_finalized` on the
+  `reconcile` report and MCP tool.
+
+### Changed
+
+- `doctor`'s "Codex sessions archived" row is now "Codex finalizer": green
+  while archived threads are still being written, yellow only when one has
+  been quiet past the bound and nothing has finalized it yet.
+
+## [1.1.0] — 2026-09-07
+
+Longhand now keeps one archive for Claude Code **and** Codex. This is the
+first release that captures a second client, and it holds that client to the
+same rules as the first: exact records, stable IDs, nothing stored twice,
+drift never silent.
+
+### Added
+
+- **`longhand codex-sync`** captures Codex Desktop and Codex CLI threads (the
+  rollouts under `~/.codex/sessions`) into the same `~/.longhand` archive the
+  Claude Code hooks write, under the same ingest lock, with `codex:`-namespaced
+  session and tool IDs. Exact-record capture by default — every message,
+  reasoning summary, tool call, and output, verbatim and searchable, without
+  loading the embedding model; `--semantic` runs the full pipeline so `recall`
+  and semantic `search` see the sessions. Per run it imports up to 50 sessions
+  of up to 16 MiB and 20,000 events each; larger ones are reported as
+  `deferred`, never partially imported. `--dry-run` lists rollouts without
+  opening the archive; `--watch` polls every 60 seconds.
+- **`reconcile --fix` captures Codex too.** New or changed rollouts are picked
+  up alongside the Claude buckets, so an installed reconciler keeps both
+  clients current with no extra setup. The report and the `reconcile` MCP
+  tool gained `codex_*` fields.
+- **`longhand shared-mcp`** — a four-tool, read-only MCP server
+  (`list_sessions` with `source` and `project` filters, `search`,
+  `get_session_timeline`, `get_event_text`) over the SQLite archive: no
+  Chroma, no model. Keyword matching, not semantic. It is the server Codex
+  talks to, and the way Claude searches Codex history by phrase.
+  `python -m longhand.lightweight_mcp` runs the same server.
+- **Commits made from Codex show up in `find_commits` and `git-log`** on the
+  default capture path — including commands run inside Codex's `exec`
+  scripts, whose `cmd:` literals are decoded for git and error detection.
+- **A Codex shapes gate.** `tests/fixtures/codex_shapes/` holds every rollout
+  record shape seen in the wild (both Codex CLI generations), and
+  `tests/test_codex_shapes.py` fails the moment one is undispositioned. Unknown
+  shapes are preserved as `unknown` events with raw JSON intact, and `doctor`'s
+  "Transcript format" row names Codex drift by its nested kind
+  (`event_msg/<kind>`).
+- **`doctor` knows about Codex.** A "Codex capture" row — only on machines
+  that have Codex — shows rollouts captured vs. changed since. Archived Codex
+  sessions are split out of "Sessions needing analysis" with the remedy that
+  actually works for them: `codex-sync --semantic`. (`analyze --all` was the
+  old advice; it never embeds events, so it could not have made them
+  searchable — a Promise 5 defect caught before it shipped.)
+- `scripts/com.longhand.codex-sync.plist.template` — a macOS LaunchAgent for
+  60-second capture, for anyone who wants faster than the reconciler.
+
+### Changed
+
+- **What Codex capture stores.** Codex writes every message twice — a
+  canonical `response_item` and a UI `event_msg` mirror — plus token
+  accounting and turn bookkeeping. Only the canonical items are stored; the
+  mirrors and bookkeeping are skipped (the same rule `KNOWN_SKIP_ENTRY_TYPES`
+  applies to Claude transcripts), and reasoning without a readable summary is
+  skipped rather than stored as an empty row. On a real corpus this removed
+  six of every ten rows without losing a searchable character.
+- **Subagent threads are skipped by default.** Codex spawns threads for
+  itself (its "guardian" approval reviewer) that re-quote the parent
+  conversation, so capturing them returned every search hit twice.
+  `--include-subagents` captures them.
+- The `mcp` dependency floor is now `>=1.2.0`, the first release with FastMCP.
+
+### Fixed
+
+- **Embedding no longer takes the CoreML path on macOS.** Every Chroma
+  collection now shares one `ONNXMiniLM_L6_V2` pinned to the CPU execution
+  provider, instead of each collection loading its own default model. The
+  CoreML build is the `Failed to create MLModel … .mlmodelc` ingest failure
+  that `doctor` had been surfacing from `hook-errors-*.log`.
+- **`frame-link` is dispositioned.** Claude Code's new entry for a published
+  page — the Artifact URL plus the local `.html` it came from — is preserved
+  as a triaged unknown (recallable, so a promotion candidate beside `pr-link`)
+  instead of tripping the drift row on every `doctor` run.
+
+---
+
+## [1.0.1] — 2026-08-12
+
+Three `doctor` rows told you the wrong thing. Found by dogfooding 1.0.0 on a
+live corpus within the hour, all the same defect Promise 5 exists to prevent:
+a diagnostic recommending a remedy that cannot work for the case it reports.
+
+### Fixed
+
+- **The update check never worked on a python.org macOS install, and said
+  "offline?" instead of saying so.** `urllib` verifies against OpenSSL's own
+  trust store rather than the system keychain, so pypi.org failed with
+  `CERTIFICATE_VERIFY_FAILED` while `curl` to the same URL succeeded — which
+  is exactly why it looked like a network problem and sat "unexplained" since
+  0.13. Longhand now verifies against certifi's CA bundle when it is
+  importable, so the check works; and when it still fails, the row names the
+  real class (TLS trust vs unreachable vs bad response) and gives the matching
+  remedy — `Install Certificates.command` on macOS, or `pip install -U certifi`.
+  If you never saw an update notice on macOS, this is why.
+- **The transcript-drift row told everyone to `pip install -U longhand`,
+  including people already on the newest release**, for whom it is a
+  guaranteed no-op — an unrecognized entry type is not handled by *any*
+  version yet. It now suggests upgrading only when one actually exists, and
+  otherwise asks you to report the type. Still cache-only; it never touches
+  the network.
+- **`file-history-delta` is now dispositioned.** Claude Code added the type
+  upstream and the drift canary caught it on a live corpus (276 in 30 days)
+  the day 1.0.0 shipped — Promise 4 doing its job. It is checkpoint bookkeeping
+  with no content, and every edit it shadows is already stored as a `tool_call`
+  event with the real diff, so it joins the skip set rather than becoming
+  unknown-event bloat.
+
+---
+
+## [1.0.0] — 2026-08-12
+
+**The promise release.** 1.0 is a commitment, not a version bump: five
+compatibility promises, each with a named enforcement artifact in the repo.
+The full text is in [COMPATIBILITY.md](COMPATIBILITY.md).
+
+This release is deliberately boring. It removes what 0.13 spent a full minor
+warning about, writes the promises down, and builds the tests that keep them
+honest. It follows a 32-day bake on 0.13.0 — zero patch releases, zero
+issues, zero defects surfaced.
+
+### Breaking
+
+- **Four deprecated CLI aliases removed**, each having warned since 0.13.0:
+  `patterns` → `recall "<topic>"`, `recap` → `status --days N`,
+  `continue` → `status --session <prefix>`, `reanalyze` → `analyze --all`.
+- **The `reconcile` MCP tool now defaults to a dry run.** Through 0.13 an
+  omitted `fix` meant `fix=true` and carried an in-payload warning that this
+  would flip. It has flipped. Dry-run responses include
+  `"hint": "pass fix=true to apply"`. If you have an agent loop that relied
+  on the implicit heal, pass `fix=true` explicitly.
+- **Six retired MCP tools left the tool listing** (19 → 13). They have *not*
+  stopped working: `search_in_context`, `get_latest_events`,
+  `get_project_timeline`, `get_session_commits`, `get_episode`, and
+  `match_project` still answer forever with a migration preamble, because
+  those names live in users' own `CLAUDE.md` files and must never hard-fail.
+
+### Added
+
+- `COMPATIBILITY.md` — the five promises, their enforcement artifacts, and an
+  explicit list of what is *not* promised.
+- `CONTRIBUTING.md`, plus a migration authoring policy in the
+  `migrations.py` header: automatic, one-time, never renumbered; no unbounded
+  work at store open; nothing destructive without opt-in; every new migration
+  ships a prior-schema fixture test.
+- **A real 0.11-schema fixture database** (`tests/fixtures/db/`), generated by
+  executing the v0.11.2 tag's own code, proving Promise 2: a 0.11 database
+  opens, migrates, and keeps every row.
+- **A surface-consistency check** that derives counts from
+  `pytest --collect-only` and `list_tools()` rather than hardcoding them, so
+  docs can no longer drift past the code they describe.
+- Zero own-deprecation warnings is now an enforced gate, not an aspiration.
+
+### Fixed
+
+- **`doctor`'s hook-error remedy was a no-op for most of what it reported.**
+  It told every hook error to run `reconcile --fix`, but `reconcile`
+  enumerates from disk, so a transcript that never landed is invisible to it
+  forever. Across the 0.13 bake, 21 of 23 real hook errors were exactly that
+  class. The remedy is now split by class and says plainly when there is
+  nothing to heal.
+- README claimed `chromadb<1.0` was pinned "on Python 3.14". The pin is
+  unconditional for every version.
+- The Stats block reported "1,033 episodes extracted (385 resolved)", which
+  reads as a 37% resolve rate. The honest figure excludes low-confidence
+  fixless extractions from the denominator: **423 of 501 (84%)**.
+
+### Platform
+
+Python 3.10–3.14 are all gated in CI. Windows is CI-tested best-effort
+(`windows-latest × py3.12`, non-blocking, green on every run since 0.13.0) —
+honest evidence, not a support tier.
+
+---
+
+## [0.13.0] — 2026-07-11
+
+Hardening release, and the v1.0 deprecation window opens. Ten PRs (#57–#66):
+the hooks become crash-proof with every failure leaving a visible breadcrumb,
+timestamps normalize to tz-aware UTC with recall windows anchored to *your*
+calendar day, error counts stop lying, upstream format drift becomes a doctor
+row instead of silent bloat, and the CLI + MCP surfaces consolidate — every
+old name keeps working through 0.x with a deprecation notice, then is removed
+at 1.0. One serious cross-platform bug fixed: on Windows, the ingest-lock
+liveness probe was *terminating* the processes it checked. Dogfooded on a
+real 338-session corpus before release (which promptly proved the new drift
+canary by catching two unknown upstream entry types on day one).
+
+### Added
+
+- **Never-crash hooks, with receipts.** stdin-invoked `ingest-session` (the
+  SessionEnd hook) now exits 0 on *every* failure — missing transcript,
+  store-open failure, oversize transcript, mid-pipeline raise — leaving a
+  one-line breadcrumb in `logs/hook-errors-YYYY-MM-DD.log`. `doctor` gains a
+  **Hook errors (7d)** row so failures stay loud without ever being fatal.
+  Explicit `--transcript` use keeps its loud exit 1. (#58)
+- **The hook guarantees are now CI-gated.** New `tests/test_hook_guarantees.py`
+  enforces all three invariants end-to-end for all three hooks: never raise
+  (13 injected-failure cases), never touch the network (record-and-raise
+  socket fixture; SessionEnd runs full analysis under it), never block the
+  prompt inline (the UserPromptSubmit hook may only spawn detached work and
+  never claims the ingest lock). (#59)
+- **Upstream drift is never silent.** The parser exports its skip-list and a
+  new triage registry; a fixture corpus (`tests/fixtures/transcript_shapes/`)
+  fails the build the moment an entry type lacks a disposition; `doctor`
+  gains a **Transcript format** row that alarms only on *new* unknown types;
+  and `scripts/harvest_entry_shapes.py` closes the loop. First run caught
+  `pr-link` and `worktree-state` — two real entry types nobody knew about.
+  (#63)
+- **`LONGHAND_DATA_DIR`.** One resolution rule everywhere (flag > env >
+  `~/.longhand`) covering the store, update-check cache, `config.json`
+  readers, and hook breadcrumbs. Child processes inherit it, so hooks,
+  spawned workers, and the MCP server follow a relocated store with no
+  flags; the launchd reconciler bakes it into the plist (launchd doesn't
+  inherit your shell env). `doctor` prints which source won, and the demo's
+  suggested env var now actually exists. (#64)
+- **Downgrade guard.** A database written by a newer longhand now refuses to
+  open with clear upgrade advice (`SchemaTooNewError`) instead of operating
+  blind against an unknown schema. Hooks still exit 0 against a too-new DB.
+  (#57)
+- **Wait-claim for the heavy writers.** `analyze`, `reattribute --fix`, and
+  `redact --apply` now wait (up to 15s) for a running ingest instead of
+  racing it, hold the ingest lock while they rewrite, and abort loudly on
+  timeout. Read-only modes stay lock-free; `redact` claims only *after* the
+  irreversibility confirm. (#60)
+- **`status --json` and `doctor --json`** for scripting. (#64)
+- **Windows CI leg** (non-blocking, evidence-gathering): `windows-latest` ×
+  py3.12 — green on both of its first two runs, full suite including
+  embeddings. (#66)
+
+### Changed
+
+- **`status` is the single resume command** (git-status shape): bare
+  `status` = recent-work digest, `status <project>` = where that project
+  left off, `status --session <prefix>` = one session's tail. (#64)
+- **MCP surface: 19 → 13 tools** via strict 1:1 absorptions — `search`
+  gains `context_events`; `list_sessions` gains `project_id`/`since`/`until`
+  (outcome-enriched); `get_session_timeline`'s `tail` covers "latest
+  events"; `find_commits`' query becomes optional (session git story);
+  `find_episodes` gains `episode_id` detail mode; `list_projects` gains
+  `match`. Docs rewritten around the survivors (repo CLAUDE.md, README —
+  including the long-wrong `get_latest_events` description — server.json,
+  install panel). (#65)
+- **Honest error counts.** `detect_error` now knows what command produced
+  the output: search hits quoting error words (the #1 false-positive source),
+  git history mentioning failures, and ENOENT from existence probes no longer
+  count as session errors — while `fatal:` from git itself and anything
+  after the noise still does. A new canary fixture pins a probe-heavy session
+  to exactly one real error. (#62)
+- **Timestamps are tz-aware UTC everywhere** (ten naive write sites fixed;
+  legacy naive rows read as UTC, no backfill), and **recall windows anchor
+  to your local calendar day** — at 5:30pm in UTC-7 the UTC date has already
+  flipped, so "today" used to silently cut your morning out. One-time
+  expectation: recall_diff rankings can shift once for non-UTC users. (#61)
+- **`recall` describes itself honestly**: the narrative comes from
+  conversation segments and session timelines; problem→fix episodes are the
+  high-precision extra when the work left clean evidence. (#65)
+
+### Fixed
+
+- **Windows: the lock-liveness probe killed the lock holder.** `os.kill(pid,
+  0)` on Windows maps to `TerminateProcess` — the "existence check" was
+  lethal on Windows installs shipping today via pip. Now probed via
+  `OpenProcess`/`GetExitCodeProcess`. This had to precede the Windows CI leg:
+  the old code would have killed pytest's own parent process. (#57)
+- The UserPromptSubmit fallback (`infer_missing_projects`) now defers
+  immediately when a live ingest holds the lock — never claims, never waits,
+  never stacks writers inside your prompt. (#60)
+- `mcp serve` / `mcp-server` share one body; `reconcile` and `reattribute`
+  cross-reference each other in `--help`. (#64)
+
+### Deprecated — removed at v1.0 (everything below still works through 0.x)
+
+| Deprecated | Use instead |
+|---|---|
+| `longhand recap` | `longhand status` (bare; `--days N`) |
+| `longhand continue <prefix>` | `longhand status --session <prefix>` |
+| `longhand patterns` | `longhand recall "<topic>"` |
+| `longhand reanalyze` | `longhand analyze --all` (deprecated since 0.12) |
+| MCP `search_in_context` | `search` + `context_events` (with `session_id`) |
+| MCP `get_project_timeline` | `list_sessions` + `project_id` (+ `since`/`until`) |
+| MCP `get_latest_events` | `get_session_timeline` + `tail` |
+| MCP `get_session_commits` | `find_commits` + `session_id` (omit `query`) |
+| MCP `get_episode` | `find_episodes` + `episode_id` |
+| MCP `match_project` | `list_projects` + `match` |
+| MCP `reconcile` with implicit `fix` | pass `fix` explicitly — the default flips to dry-run at 1.0 |
+
+Deprecated CLI commands are hidden and print a pointer; deprecated MCP tools
+stay listed with a `[DEPRECATED — use …]` prefix and prepend a one-line
+migration note to their payloads. At 1.0 the retired MCP names leave the
+tool listing but keep answering forever, so saved instructions never break.
+
+---
+
+## [0.12.0] — 2026-07-10
+
+Feature release: the update channel, cleaner attribution, sharper episodes,
+and storage hygiene. One new migration pair (7 and 8) — both O(1) and applied
+automatically on first open; existing data is never re-processed without your
+say-so. Everything below was dogfooded on a real 331-session corpus before
+release, which itself surfaced (and fixed) three long-standing bugs.
+
+### Added
+
+- **Update channel.** `longhand --version` / `-V` prints the installed
+  version; the interactive CLI checks pypi.org for a newer release at most
+  once a day (cache-only hints, printed after your command's output, TTY
+  only) and `doctor` gains a Version row. The check never runs from hooks or
+  the MCP server — enforced by a test — never blocks a command, and
+  `LONGHAND_NO_UPDATE_CHECK=1` disables it entirely. The README privacy
+  section discloses exactly what it does. (#46)
+- **`longhand db vacuum`** (opt-in, never automatic) — reclaim disk space
+  with a free-space preflight and the ingest lock held; `--prune-aux`
+  first deletes stored harness-noise events. `doctor` now shows SQLite +
+  vector store sizes. (#51)
+- **Reconcile sees more.** New `partially_indexed` bucket for sessions whose
+  ingest crashed mid-pipeline (repaired by `--fix`), and `skipped_oversize`
+  for transcripts past the parser's size cap. Pre-existing rows are treated
+  as complete — no re-analysis stampede on upgrade. (#48, #52)
+
+### Changed
+
+- **Attribution overhaul.** The project-root walk now prefers the highest
+  `.git` over nearer non-git markers (monorepo packages stop splitting into
+  per-package projects); paths are normalized to the filesystem's own casing
+  (case-dupe spellings mint one project); and sessions with no cwd or a
+  markerless cwd in reserved locations ($HOME root, temp/pytest dirs, plugin
+  caches, Claude Code internals) land in one explicit `unattributed` bucket
+  instead of minting junk projects. `longhand reattribute` is now **dry-run
+  by default** — review the move list, then `--fix` to apply and prune
+  emptied projects. (#49)
+- **Episode extraction got honest.** Verification requires an explicit
+  success flag or an error-free result from a command-executing tool —
+  Read/Grep output no longer marks episodes "resolved". A new error always
+  starts a new episode instead of being swallowed by the previous one.
+  Harness plumbing (`<task-notification>` and friends) is never a problem
+  anchor, and the leaked `Ask: ` scaffold is gone from problem descriptions
+  (migration 8 cleans existing rows). The `find_episodes` MCP tool now
+  defaults to `min_confidence: 0.5` (pass 0 for everything); low-confidence
+  episodes are filtered by default, never deleted. Historical labels change
+  only when you run `longhand analyze --all`. (#50)
+- **`analyze --all` now reaches your whole corpus and truly replaces.**
+  Sessions whose transcripts rotated off disk are rebuilt from the events
+  table (previously ~75% of a mature corpus was unreachable), and
+  re-analysis deletes a session's old episodes/segments before extracting —
+  no more stale-boundary duplicates accumulating in SQLite and vector
+  search. (#53, #54)
+- **The prompt hook never embeds inline.** The first-recall-after-upgrade
+  episode backfill (up to the whole corpus, synchronously, inside the
+  UserPromptSubmit hook) is now a detached `backfill-episodes` worker that
+  claims the ingest lock. (#47)
+
+### Fixed
+
+- Harness UI-state entries (`last-prompt`, `mode`, `permission-mode`,
+  `attachment`, `ai-title`, `agent-name`) are no longer stored as "unknown"
+  events with full raw JSON — they were the 3rd-largest event type on a real
+  corpus. (#51)
+- The hook installer's no-PATH fallback wrote dead `-m longhand.cli`
+  commands (the v0.11.2 background-spawn bug class); hooks installed without
+  `longhand` on PATH now actually run. (#52)
+- The MCP server reuses one store across tool calls (it re-ran migrations
+  and re-opened ChromaDB on every call) and wraps handler failures in a
+  readable JSON error instead of a raw traceback. (#52)
+- Session-id prefix lookup (`longhand timeline <prefix>` etc.) now searches
+  the whole corpus in SQL — it previously scanned only the 1,000 most
+  recent sessions, so older prefixes silently failed to resolve. (#52)
+- Segment ids no longer collide when rebuilt events carry duplicate
+  sequence numbers — a collision failed the session's whole embedding
+  batch. (#54)
+- The credit-card redaction pattern is skipped unless a cheap digit-run
+  pre-check fires, cutting redaction CPU on numeric-heavy transcripts;
+  masking behavior is unchanged. (#52)
+
+### Internal
+
+- First direct tests for `session_summary_embedding`, `segment_search`,
+  `vector_store`, and `cli/helpers`; suite now 421 tests. Third-party
+  deprecation noise filtered in pytest config (6,426 → 95 warnings). (#52)
+
+## [0.11.2] — 2026-07-10
+
+Bugfix release from a full audit of the codebase and a live 324-session corpus:
+multi-process reliability, Windows correctness, and a privacy gap in `redact`.
+No schema changes and no new migrations — deliberately, so the migration-race
+fix below reaches every install before any future migration ships.
+
+### Fixed
+
+- **Background semantic-index catch-up actually runs again.** The recall
+  fallback spawned `python -m longhand.cli` — a package with no `__main__.py` —
+  so every background ingest died instantly, and silently (output went to a log
+  file, exceptions were swallowed). The spawn now targets `python -m longhand`,
+  and a regression test asserts the spawn target is importable and runnable so
+  this class of bug can't ship again. If your ChromaDB vector index has lagged
+  behind the main database, it will converge over subsequent recalls. (#41)
+- **Parallel sessions no longer race ChromaDB.** SessionEnd ingest was the one
+  write path that never took the ingest lock, so two sessions ending together
+  could open concurrent ChromaDB writers on the same directory (lock errors,
+  HNSW-index corruption risk). It now claims the lock and — if a bulk ingest
+  holds it — defers with a success exit instead of failing; `reconcile` or the
+  background sweep picks the session up later. (#41)
+- **The Stop hook can no longer crash on store construction.** `ingest-live`
+  promised "never raises" but built the store, checked the tail cursor, and
+  claimed the lock *outside* its guard — a corrupted Chroma dir, a full disk,
+  or a migration race would have crashed the hook every turn. The whole body is
+  now guarded; init failures return a summary dict and exit 0. (#41)
+- **Concurrent first-run migrations no longer crash the loser.** Two processes
+  applying the same migration right after an upgrade (parallel session hooks,
+  the CLI, and the MCP server all construct stores) raced `schema_version` and
+  the loser crashed with `sqlite3.IntegrityError`; it now waits for the
+  winner's version row and continues. SQLite `busy_timeout` also raised
+  5s → 30s for compaction-heavy parallel writes. (#41)
+- **`find_episodes` no longer returns `[]` by default on noisy corpora.** The
+  `has_fix=true` default filtered in Python *after* SQL's
+  `ORDER BY ended_at DESC LIMIT`, so when the newest N episodes were fixless
+  extraction noise, every with-fix episode fell past the limit and the tool's
+  default call came back empty. The filter now lives in the SQL `WHERE`. (#44)
+- **Windows: subagent transcripts are no longer ingested as real sessions.**
+  The `"/subagents/"` substring check never matched backslash paths; the
+  filter now checks path components. (#44)
+- **Windows: drift scan no longer crashes on non-ASCII transcripts.** A bare
+  `open()` used the platform encoding (cp1252 on Windows) with strict
+  decoding, and the resulting `UnicodeDecodeError` escaped through
+  `recall_project_status`. Now UTF-8 with `errors=replace`, matching the main
+  parser. (#44)
+- **Outcome classifier: error → clean → error is "stuck", not "fixed".** A
+  clean result now only counts as "ended clean" when it came after the *last*
+  error, so sessions that ended broken stop inflating the fixed count.
+  Historical labels are unchanged unless you re-run `longhand analyze --all`.
+  (#44)
+- **`redact --apply` now actually covers segments — and git commit messages.**
+  The retroactive-redaction table map named a nonexistent `segments` table
+  (the real one is `conversation_segments`), and per-table error handling
+  silently skipped it — so segment topics (the verbatim first user message),
+  summaries, and keywords were never scanned. Git commit messages weren't
+  listed at all. Both are covered now; re-run `longhand redact --apply` if
+  you've relied on it. (#44)
+
+## [0.11.1] — 2026-06-18
+
+Bugfix release: per-project rollup counters were inflated, and sessions could be
+filed under the wrong project. No schema-breaking changes; a one-time migration
+repairs existing databases automatically on first open.
+
+### Fixed
+
+- **Project misattribution: sessions no longer drift to the wrong project.**
+  `session.cwd` (set by the Stop-hook live tail via `MAX(cwd)`, a meaningless
+  lexicographic pick) and `project_id` (set only by the full analysis pass) were
+  written by independent paths and could desync — so work launched from `$HOME`
+  ended up filed under the home catch-all project, invisible to per-project
+  recall. On a real 265-session corpus, 35 sessions (13%) were affected. Now
+  project attribution and cwd are always derived together from the same events
+  (`attribute_session_project()`), and the live tail derives cwd the same way
+  `build_session` does instead of `MAX(cwd)`. New `longhand reattribute` command
+  re-derives every session's project from the **events table** (not the
+  transcript, which may have rotated away) to repair existing databases.
+- **`projects.session_count` and `projects.total_edits` no longer double-count.**
+  `upsert_project()` incremented both columns on *every* (re-)ingest of a session
+  — SessionEnd, the live-tail Stop hook's analysis path, and `reconcile`
+  re-ingests — so they counted ingest events, not distinct sessions. On a real
+  corpus the home directory showed 2,068 "sessions" against 264 real ones (and
+  53,952 edits against ~7,200 actual). The columns are now derived rollups,
+  recomputed authoritatively from the `sessions` table
+  (`recompute_project_stats()`) after each session is attached. Affected
+  `longhand projects`, the `list_projects` MCP tool, and `recall_project_status`;
+  raw session/event data, search, and recall were never affected.
+- **Migration v6 backfills existing databases**, recomputing both columns for all
+  projects from the `sessions` table on first open. Idempotent and non-destructive.
+
+## [0.11.0] — 2026-06-09
+
+UX release: the CLI gets organized, the stats get honest, and first-run gets smarter. No breaking changes — every existing command and flag still works.
+
+### Changed
+
+- **`longhand --help` is now grouped.** Commands render in six panels — Recall, Archaeology, Browse & insights, Data, Setup & health, Plumbing — instead of a 40-command alphabetical list. (#28)
+- **Plumbing commands are hidden** (still fully callable, exact names unchanged): `ingest-session`, `ingest-live`, `context`, `backfill-episodes`, `mcp-server`. These are hook/desktop-config entry points, not user commands. (#28)
+- **`analyze --all` now also rebuilds episode embeddings**, absorbing what `reanalyze` did. `reanalyze` remains as a hidden deprecated alias that warns and delegates — it will be removed in v1.0. (#28)
+- **Honest episode stats.** `longhand stats` and the `get_stats` MCP tool now split out `low_confidence_episodes` (fixless extractions below 0.5 confidence — probes and tool churn, not real problems) and report `resolved_rate_pct` over substantive episodes only. Your resolved rate was never as bad as the old denominator made it look. (#28)
+- **First-run output teaches with your own data.** `setup` ends with an indexed-summary line (sessions · projects · episodes) and suggests `longhand status "<your top project>"` instead of a placeholder. (#28)
+
+### Deprecated
+
+- `longhand reanalyze` → use `longhand analyze --all`. Alias removed in v1.0.
+
+## [0.10.0] — 2026-06-09
+
+Feature release: opt-in secret redaction, plus recall-quality and toolchain hardening.
+
+### Added
+
+- **Secret redaction at ingest (opt-in).** `longhand config --set redact.enabled=true` masks secret-shaped strings — Anthropic/OpenAI/AWS/GitHub/Google/Slack/Stripe keys, SSH key headers, JWTs, database URLs with passwords, SSNs, and Luhn-validated card numbers — at parse time, before they reach SQLite, the raw JSON blobs, or the vector index. Masks keep only the first/last 4 characters and the length (`sk-a…wxyz (len=50)`). Default is off: Longhand stays forensic unless you opt in. (#26)
+- **`longhand redact`** — retroactive scan of an existing store. Reports pattern names and counts only (never the matched values); `--apply` masks matches in place across events, episodes, segments, and outcomes, and re-embeds changed vector documents. (#26)
+
+### Fixed
+
+- **Benign noise no longer counts as errors.** The error detector now skips known-noise lines — Next.js streaming-SSR `data-dgst`/`<!--$!-->` markers, "0 failing"/"Tests: 0 failed" summaries, empty `error:` fields, `Error: Task not found` tool churn, and missing-GNU-`timeout` probes — while continuing to scan, so real errors in the same output still register. This was the main inflator of the unresolved-episode rate. Run `longhand analyze --all` to re-extract episodes with the cleaner detector. (#25)
+
+### Security
+
+- chromadb is now capped `<1.0` for **all** Python versions (previously unbounded below 3.14) — a chromadb 1.x release can no longer break fresh installs. (#25)
+
+### Internal
+
+- mypy is clean (21 → 0 errors) and the CI typecheck job is now blocking. (#25)
+- `ruff format` adopted repo-wide and gated in CI. (#24)
+- 311 tests (280 → 311). The May 2026 audit report is archived under `docs/audits/`. (#24–#26)
+
+## [0.9.4] — 2026-06-09
+
+Hardening release: closes the six findings left open after the v0.9.3 security audit (AUDIT-2026-05-28). No new features, no API changes.
+
+### Fixed
+
+- **Parser no longer crashes on non-object JSON lines.** A transcript line that is valid JSON but not an object (a bare list, string, or number) raised `AttributeError` and silently lost the rest of the session. Both the full-parse and live-tail paths now skip such lines. (#22)
+- **Ingest lock is now race-safe.** `claim_ingest_lock` used a check-then-write that let two racing processes both believe they held the lock. The lock is now claimed with an atomic `O_CREAT|O_EXCL` create; stale locks from dead PIDs are unlinked and re-claimed. (#22)
+
+### Security
+
+- **MCP input bounds tightened.** A negative `limit` could slip past the cap and become SQLite's unbounded `LIMIT -1`; `limit` is now clamped to `[1, 1000]` and `offset` floored at 0. Semantic queries are capped at 2,000 characters before reaching the ChromaDB ONNX encoder, across all query-taking tools. Local-only exposure either way, but defense-in-depth is cheap. (#22)
+
+### Internal
+
+- The `posthog<3.0` pin is now documented in `pyproject.toml`: it deliberately constrains chromadb's transitive telemetry client (posthog ≥3 breaks chromadb's `capture()` calls and floods stderr — the v0.5.11 fix). It is not a dead dependency; do not remove it.
+- Un-skipped the fixless-episode forensic assertion in the test suite (it passes) and added coverage for the parser guard, lock atomicity, and MCP bounds. 273 → 280 tests.
+
+## [0.9.3] — 2026-05-28
+
+Bug-fix release: restores two features that were silently broken in Claude Code, plus CI/test/doc hardening.
+
+### Fixed
+
+- **Auto-context injection hook restored.** The `UserPromptSubmit` hook imported `context` from `longhand.cli`, which exports only `app` after the `cli.py` → `cli/` package split. The swallowed `ImportError` made the hook emit `{}` on every prompt — so automatic context injection had been silently dead since v0.9.0. (#11)
+- **MCP tools now load in Claude Code.** 12 of 19 tools declared an `outputSchema` whose `type` was `array`/`oneOf`; Claude Code's MCP validator rejects any `outputSchema.type` that isn't `"object"`, so those tools silently failed to load. Handlers return text (never structured content), so the schemas were decorative — they are now stripped before tools reach the client. (#9)
+
+### Changed
+
+- `SECURITY.md` corrected to describe the two fixed-argv `subprocess` call sites and the single hardcoded-identifier `PRAGMA` f-string. The code was always injection-safe; the "no subprocess / zero f-string SQL" claims were stale. (#12)
+
+### Internal
+
+- CI now tests Python 3.14 (non-blocking — onnxruntime's cp314 wheel intermittently raises an illegal-instruction SIGILL on GitHub's heterogeneous runners), gates coverage at `--cov-fail-under=60`, and runs a non-blocking `mypy` job. (#13)
+- Behavioral test backfill for the CLI and the recall time parser; total coverage 66% → 73%, `time_parser.py` → 100%. (#14)
+
+## [0.9.2] — 2026-05-17
+
+`longhand demo` — try Longhand on a sample corpus without touching your real history.
+
+### Added
+
+- **New `longhand demo` CLI command.** Generates a sandboxed store at
+  `/tmp/longhand-demo-<timestamp>/`, seeds it with 3 fictional Claude Code
+  sessions covering a realistic Stripe-webhook bug + Supabase auth migration
+  + downstream 401 fix on a `demo-shop` project, then walks through `recall`
+  and `recall_project_status` against the seeded store so the user can see
+  what the output looks like before pointing Longhand at their own data.
+  Cleans up afterwards; pass `--keep` to leave the sandbox in place for
+  further exploration with `LONGHAND_DIR=<path> longhand …`.
+- `longhand.demo` package containing the corpus generator
+  (`longhand/demo/corpus.py`) and walkthrough runner
+  (`longhand/demo/runner.py`). 6 new tests verify the corpus is
+  deterministic, valid Claude Code event shape, ingests cleanly into a
+  fresh store, and that recall returns sensible results against the seeded
+  data.
+
+### Why
+
+The 2026-05-17 audit identified an onboarding gap: new users had no way to
+preview Longhand on safe data before running `longhand setup` on their
+real `~/.claude`. `longhand demo` closes that gap with a 60-second
+walkthrough that exercises the cross-session recall, file history, and
+project-status surfaces without modifying anything on disk outside the
+sandbox.
+
+### Tests
+
+- 228 tests passing (was 222).
+
+---
+
+## [0.9.1] — 2026-05-05
+
+Tool definition quality pass. Every MCP tool now serializes a human-readable
+`title`, an `annotations` block (`readOnlyHint`, `openWorldHint`, plus
+`idempotentHint` on `reconcile`), and — for the 17 tools whose response is
+pure structured JSON — an `outputSchema` describing the response shape.
+
+### Added
+
+- `title`, `annotations`, and `outputSchema` on all 19 MCP tools. Two
+  helper constants (`_READ_ONLY` and `_RECONCILE_HINTS`) at the top of
+  `mcp_server.py` keep the per-tool blocks readable.
+- Anti-pattern callouts in the descriptions of the four lowest-scoring
+  tools (`get_stats`, `replay_file`, `get_project_timeline`,
+  `get_session_commits`) and the borderline tools (`find_episodes`,
+  `get_episode`, `find_commits`, `list_projects`, `list_sessions`,
+  `get_file_history`, `replay_file`) — every tool description now names
+  what NOT to use it for, making tool selection sharper.
+- `server.json` description tightened to mention tool count and capability
+  grouping.
+
+### Why
+
+GLAMA scores MCP tool definitions on six dimensions, with `outputSchema`
+and `annotations` being two MCP-spec fields most directly tied to
+"Behavioral Transparency" and "Contextual Completeness." This release adds
+both across the surface so MCP clients (and ranking sites like GLAMA) can
+treat each tool as documented metadata rather than free-form prose.
+
+No behavior changes. No breaking schema changes.
+
+---
+
+## [0.9.0] — 2026-04-28
+
+Live ingestion. Sessions are now ingested incrementally during the session
+instead of only at SessionEnd, so a Claude Code crash can no longer wipe an
+in-progress session's events from the index.
+
+### Added
+
+- **`Stop` hook + `longhand ingest-live` command.** Fires once per assistant
+  turn. Tail-reads new bytes from the transcript JSONL and upserts new
+  events into SQLite. Skips heavy analysis (episodes, segments, embeddings,
+  project inference) — those still run at SessionEnd. The events table
+  stays current within seconds of each turn, so an editor crash, a kernel
+  panic, or a stuck SessionEnd subprocess no longer means lost work.
+  `longhand hook install` now installs both SessionEnd and Stop in one go.
+- **Plan history is now first-class.** Every Write/Edit to a
+  `~/.claude/plans/*.md` file is captured as an event. The new
+  `plans_index` SQL view (`longhand plans list` / `mcp_longhand_list_plans`)
+  exposes them in chronological order. Pair with `replay_file` to
+  reconstruct an early version of a plan that was later overwritten —
+  previously, only the final plan was visible because the file on disk
+  had been overwritten by the time SessionEnd fired.
+- **`longhand schedule install-reconciler`** writes a launchd job
+  (macOS) that runs `longhand reconcile --fix` every 30 minutes.
+  Belt-and-suspenders for hard crashes that take down both hooks. Opt-in;
+  `longhand doctor` flags it when missing.
+- **MCP tool `list_plans`** for the Claude-side view of plan history.
+
+### Changed
+
+- **SQLite WAL mode** enabled at first connect. Cuts hook latency under
+  contention from worst-case 5s (`busy_timeout`) to ~10ms. Single-user DB,
+  safe.
+- **`longhand hook uninstall`** now also removes the Stop hook.
+- **`longhand doctor`** has new rows for Stop hook and Reconciler job.
+
+### Schema
+
+- Migration v5: adds `last_offset` column to `ingestion_log` (live cursor
+  separate from `file_size`, which still tracks last-full-ingest size).
+  Backfill: existing rows get `last_offset = file_size`. Adds
+  `plans_index` view over `events`.
+
+### Tests
+
+- 11 new tests covering: stdin contract, offset advance, partial-line
+  handling, lock contention, plans_index view, migration v5,
+  live → SessionEnd composition, episodes-skipped invariant.
+- 222 tests passing (was 211).
+
+---
+
+## [0.8.1] — 2026-04-23
+
+Closes the staleness silent-failure class across MCP entry points and
+exposes `reconcile` as an MCP tool so Claude can self-heal the index from
+inside a session.
+
+### Fixed
+
+- **`search` and `list_sessions` now surface `stale: true / stale_reason`**
+  when the project they're scoped to has on-disk transcripts not yet in the
+  DB. Pre-v0.8.1 these tools returned clean-looking empty results — same
+  failure shape `recall_project_status` was built to catch, just one layer
+  up. Caught live tonight: `search("portneuf junk removal")` returned
+  `hits: []` for a project whose only transcript existed on disk but
+  hadn't been ingested yet. `recall_project_status` already reported
+  staleness; now `search` and `list_sessions` do too.
+- **`list_sessions` default `limit` raised from 20 to 50.** Active days
+  routinely cross 5+ projects across 5+ sessions; the old default
+  truncated reviews silently.
+
+### Added
+
+- **`reconcile` MCP tool.** Wraps `longhand reconcile --fix` so Claude can
+  re-ingest missing transcripts in-session after a staleness banner fires —
+  no shell-out required. Defaults to `fix=True` for MCP callers (CLI keeps
+  `fix=False` default — dry-run summary). Same ingest lock as the CLI; safe
+  under concurrent ingestion.
+- **Shared reconcile core** at `longhand/recall/reconcile.py` with a
+  `ReconcileReport` dataclass. CLI and MCP tool both call `run_reconcile`;
+  only the presentation differs.
+- **`staleness_banner()` helper** in `recall_pipeline.py` — thin wrapper
+  over `_detect_project_drift` for any handler that needs the same
+  drift signal `recall_project_status` returns. Cache-backed; cheap on
+  repeat calls.
+
+### Tests
+
+- 6 new tests covering: search staleness on auto-scope, list_sessions
+  staleness on project filter, reconcile dry-run, reconcile fix-ingests,
+  reconcile MCP default of `fix=True`, dispatch count.
+- 211 tests passing (was 205).
+
+---
+
+## [0.8.0] — 2026-04-23
+
+Cleaner narratives + a real bug-finding test layer underneath.
+
+### Fixed
+
+- **`fix_summary` no longer leaks the literal `"Intent:"` label.**
+  Pre-v0.8 `_compose_fix_summary` prepended `"Intent: "` to the assistant's
+  intent text "for embedding structure" (per the original comment). The
+  label leaked into every recall narrative for affected episodes. Audit on
+  the reference corpus showed 100 of 204 episodes (49%) had this. Migration
+  v4 strips it from existing rows on first store open; no command needed.
+- **`fix_summary` diff content now truncates at clean boundaries.** The
+  hard `[:120]` byte slice landed mid-token (`phoneNum'`, `family?:'`,
+  `strin'`). New `_truncate_at_boundary` helper backs off to the last
+  whitespace within budget and appends `…`. Forward-only — existing rows
+  stay until reingestion.
+- **Recall narrative footer "Other matches" lines now include the
+  `session_id`.** Was silently hiding which session each match came from,
+  leaving the user unable to drill in.
+- **Recall now surfaces secondary segment matches** in an "Also possibly
+  relevant" footer when episodes win the primary slot. Cross-session hits
+  used to be dropped silently when episodes were the primary surface.
+
+### Added
+
+- **Canary harness** at `tests/canary_harness.py` +
+  `tests/test_canary_corpus.py`. Auto-discovers fixture modules under
+  `tests/fixtures/corpus/`. Default assertion mode is `"narrative"` (what
+  users read), not internal arrays. Each canary pins a real shipped bug;
+  new ones must prove teeth (fail before the fix, pass after) before
+  landing. See `tests/fixtures/corpus/README.md` for the convention.
+- **Real-corpus recall validator** at `scripts/recall_diff.py`. Snapshots
+  top-N episode/segment IDs and narrative session prefixes for a fixed
+  query list against `~/.longhand`, diffs against a saved baseline. Closes
+  the gap pytest can't see — ranking shifts on real data.
+
+### Changed
+
+- Removed the `event_semantic_boost` ranking signal and its supporting
+  `semantic_event_scores` step. The comment already called it the "older
+  path, secondary signal"; `episode_semantic_boost` from the episode's
+  own embedding distance is the modern equivalent. Net: 1 fewer ranking
+  signal, 1 fewer vector-search call per `recall()`.
+- Pulled the inline keyword-extraction regex + stopword list to a
+  documented module-level helper (`_extract_query_keywords`).
+
+### Migrations
+
+- **v4** — strips leaked `"Intent: "` prefix from existing `fix_summary`
+  rows. Auto-applies on next store open. Embeddings are not re-generated
+  (semantic clusters of `"Intent: foo"` and `"foo"` are close enough that
+  ranking is unchanged; the validator confirmed).
+
+---
+
+## [0.7.0] — 2026-04-22
+
+Cleaner recall output, faster drift checks. Follow-ups to the v0.6.0 audit.
+
+### Added
+
+- **`longhand doctor` freshness check.** New "Recent ingest (7d)" row
+  compares on-disk JSONL mtimes against the sessions table. Red ✗ with
+  reconcile hint when most transcripts from the past week aren't indexed
+  — catches the silent-hook-failure class of bug.
+- **Drift-detection cache** at `~/.longhand/cache/jsonl_project_map.json`,
+  keyed on `(transcript_path, mtime)`. Warm-call `recall_project_status`
+  drops from ~2,333ms → ~68ms (34× speedup). Cold calls unchanged.
+- **`search` auto-scopes to a matched project** when the query names a
+  known project at confidence ≥0.8. Response wraps in
+  `{auto_scoped_to, auto_scope_hint, hits}` so agents can override.
+
+### Fixed
+
+- Narrative drops commits with no parseable hash at three layers
+  (extractor returns `None`, SQL filters them out, narrative skips any
+  that slip through). No more empty backticks in the rendered output.
+- "Last session" trailer in `recall_project_status` now sources from the
+  most-recent episode's `fix_summary` instead of `session_outcomes.summary`
+  (which was the first user message of the session, not a fix description).
+
+---
+
+## [0.6.0] — 2026-04-22
+
+Recall sees sessions it previously missed. Driven by a dogfood test where
+`recall_project_status("bsoi-mesh-kit")` returned "No session history found"
+despite four real transcripts on disk.
+
+### Fixed
+
+- **Project inference no longer uses first-event `cwd` only.** Sessions
+  that launch from `$HOME` and `cd` into a project mid-session were
+  losing attribution (project_id → NULL). `build_session` now tallies
+  all event cwds, filters out `$HOME` and paths without project markers,
+  and picks the mode.
+- **Subagent JSONL transcripts under `*/subagents/*.jsonl` are no longer
+  treated as top-level sessions.** Pre-existing bug exposed by the new
+  `reconcile` command — subagent files were being re-ingested as
+  standalone sessions, double-counting totals.
+
+### Added
+
+- **`longhand reconcile [--fix]`** command. Walks `~/.claude/projects`,
+  buckets transcripts into fully-indexed / NULL-project / missing, and
+  can re-ingest the problem rows using the improved inference. Closes
+  the silent-hook-failure recovery loop.
+- **`recall_project_status` drift detection.** New fields:
+  `session_count_indexed`, `session_count_on_disk`, `last_ingested_at`,
+  `last_transcript_mtime`, `stale`, `stale_reason`. When stale, the
+  narrative is prepended with `⚠` pointing at `reconcile --fix`.
+
+---
+
+## [0.5.13] — 2026-04-20
+
+Audit cleanup bundle. Five small independent changes, no API impact.
+
+- Close FD leak in `trigger_background_ingest` (parent FD now closes once
+  Popen has duplicated it into the child).
+- Capture batched-embedding return counts in `analyze_session` so callers
+  see how many vectors actually landed in Chroma.
+- Fold v1 migration columns into the base schema (cleaner fresh-install
+  path).
+- Dedupe `_resolve_session_prefix` (had two implementations).
+- Introduce `CHROMA_BATCH_SIZE` constant (was a scattered magic number).
+
+---
+
+## Earlier releases
+
+For v0.5.12 and earlier, see the annotated git tags:
+
+```bash
+git tag -l 'v0.*' --sort=-v:refname
+git show v0.5.12          # tag annotation has the release notes
+```
+
+Highlights:
+
+- **v0.5.12** — Large-corpus ingest performance improvements.
+- **v0.5.x** series — Iterative quality fixes after v0.5.0 went on PyPI
+  (2026-04-14, the first public release).
+- **v0.5.0** — First PyPI release. SQLite + Chroma, episode extraction,
+  fuzzy recall, MCP server, hook installer.
+- **v0.4.x** — Pre-PyPI. Local-only iteration on episode extraction,
+  segment search, narrative composition.
+- **v0.3.x** — Pre-PyPI. Compare/check/repair CLIs.
+- **v0.2.x** — Pre-PyPI. Proactive memory layer (project inference,
+  outcome tagging, episode pairs).
+- **v0.1.x** — Pre-PyPI. Initial parser + SQLite + Chroma scaffolding.

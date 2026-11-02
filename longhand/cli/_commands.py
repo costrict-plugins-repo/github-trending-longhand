@@ -1,0 +1,2960 @@
+"""
+Longhand CLI.
+
+Commands:
+    longhand ingest [path]          — ingest Claude Code session files
+    longhand sessions               — list ingested sessions
+    longhand search <query>         — semantic search across events
+    longhand timeline <id>          — chronological view of a session
+    longhand replay <id> <file>     — reconstruct a file at a point in a session
+    longhand diff <event_id>        — show the before/after of a single edit
+    longhand stats                  — overall storage stats
+    longhand recall "<question>"    — proactive memory: fuzzy natural-language recall
+    longhand analyze                — re-run analysis on existing sessions
+    longhand projects               — list inferred projects
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import typer
+from rich.markdown import Markdown
+from rich.markup import escape
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.table import Table
+from rich.text import Text
+
+from longhand.cli.backup_commands import backup_app, restore
+from longhand.cli.helpers import (
+    _format_timestamp,
+    _get_store,
+    _resolve_prefix,
+    console,
+)
+from longhand.codex import (
+    DEFAULT_FINALIZE_AFTER_SECONDS,
+    DEFAULT_MAX_EVENTS,
+    DEFAULT_MAX_FILE_BYTES,
+    DEFAULT_SESSION_LIMIT,
+)
+from longhand.parser import JSONLParser, discover_sessions
+from longhand.recall import recall as recall_pipeline
+from longhand.replay import ReplayEngine
+from longhand.setup_commands import (
+    CLAUDE_CODE_MCP_ADD,
+)
+from longhand.setup_commands import (
+    doctor as _doctor,
+)
+from longhand.setup_commands import (
+    hook_install as _hook_install,
+)
+from longhand.setup_commands import (
+    hook_uninstall as _hook_uninstall,
+)
+from longhand.setup_commands import (
+    ingest_single_session as _ingest_single,
+)
+from longhand.setup_commands import (
+    mcp_install as _mcp_install,
+)
+from longhand.setup_commands import (
+    mcp_uninstall as _mcp_uninstall,
+)
+from longhand.setup_commands import (
+    prompt_hook_install as _prompt_hook_install,
+)
+from longhand.setup_commands import (
+    prompt_hook_uninstall as _prompt_hook_uninstall,
+)
+from longhand.setup_commands import (
+    run_prompt_hook as _run_prompt_hook,
+)
+
+if TYPE_CHECKING:
+    from longhand.storage import LonghandStore
+
+app = typer.Typer(
+    name="longhand",
+    help="Persistent local memory for Claude Code sessions. Every event, every edit, nothing summarized.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+
+# Hook/plumbing entry points where the update check must never run: hooks fire
+# on every Claude Code turn and the MCP server is a long-lived subprocess —
+# neither may gain network calls, extra output, or startup latency. Every
+# hidden command belongs here (enforced by test_update_check.py).
+_UPDATE_CHECK_EXCLUDED = {
+    "__prompt-hook-run",
+    "backfill-episodes",
+    "context",
+    "ingest-live",
+    "ingest-session",
+    "mcp-server",
+}
+
+
+def _version_callback(value: bool) -> None:
+    if not value:
+        return
+    from longhand import update_check
+    from longhand.version import __version__
+
+    console.print(f"longhand {__version__}")
+    hint = update_check.hint_from_cache()
+    if hint:
+        console.print(hint, style="dim")
+    raise typer.Exit()
+
+
+@app.callback()
+def _app_main(
+    ctx: typer.Context,
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-V",
+        callback=_version_callback,
+        is_eager=True,
+        help="Print the installed version and exit.",
+    ),
+):
+    if ctx.invoked_subcommand not in _UPDATE_CHECK_EXCLUDED:
+        from longhand import update_check
+
+        # Runs after the command finishes: prints the cache-only hint, then
+        # refreshes the cache (24h TTL) so the *next* run knows what's newest.
+        ctx.call_on_close(update_check.after_command)
+
+
+# -----------------------------------------------------------------------------
+# SETUP — one-command install wrapper
+# -----------------------------------------------------------------------------
+
+
+@app.command(rich_help_panel="Setup & health")
+def setup(
+    skip_ingest: bool = typer.Option(
+        False, "--skip-ingest", help="Skip backfilling existing sessions"
+    ),
+    skip_prompt_hook: bool = typer.Option(
+        False, "--skip-prompt-hook", help="Skip auto-context injection hook"
+    ),
+    skip_mcp: bool = typer.Option(False, "--skip-mcp", help="Skip MCP server install"),
+    skip_analysis: bool = typer.Option(
+        False,
+        "--skip-analysis",
+        help=(
+            "Skip the analysis pass during the backfill: no episodes, segments, or "
+            "session/project vectors. Events are still stored and embedded, so "
+            "`search` works. Run `longhand analyze --all` later to add the rest."
+        ),
+    ),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """One-command setup: ingest existing sessions, install hooks, configure MCP.
+
+    Five steps, each of which you could run on its own:
+      1. longhand ingest               (backfill Claude Code history, analysis included)
+      2. longhand hook install         (SessionEnd + Stop: auto-ingest future sessions)
+      3. longhand prompt-hook install  (auto-inject past context; --skip-prompt-hook)
+      4. longhand mcp install          (Claude Desktop; setup prints the Claude Code command)
+      5. longhand doctor               (verify everything)
+
+    Takes about two minutes on a laptop with a year of sessions. Safe to re-run;
+    it re-ingests every session.
+
+    For huge histories (>1GB of ~/.claude/projects), pass ``--skip-analysis`` to
+    defer episode and segment extraction to a later ``longhand analyze --all``
+    run. Events are still stored and embedded, so it saves the analysis time,
+    not the embedding time.
+    """
+    console.print("[bold cyan]→ Longhand setup[/bold cyan]\n")
+
+    _get_store(data_dir)
+
+    # 1. Ingest existing history
+    if not skip_ingest:
+        label = (
+            "Ingesting existing Claude Code sessions (events only, --skip-analysis)..."
+            if skip_analysis
+            else "Ingesting existing Claude Code sessions..."
+        )
+        console.print(f"[bold]1/5[/bold] {label}")
+        try:
+            target = Path.home() / ".claude" / "projects"
+            if target.exists():
+                sessions = discover_sessions(target)
+                ingested = 0
+                for idx, session_path in enumerate(sessions):
+                    try:
+                        _ingest_single(
+                            str(session_path),
+                            data_dir,
+                            run_analysis=not skip_analysis,
+                        )
+                        ingested += 1
+                    except Exception:
+                        pass
+                    if idx > 0 and idx % 20 == 0:
+                        console.print(f"   {idx}/{len(sessions)}...")
+                console.print(f"[green]   ✓[/green] Ingested {ingested} session(s)")
+                if skip_analysis:
+                    console.print(
+                        "   [dim]Run `longhand analyze --all` to populate episodes/segments/vectors.[/dim]"
+                    )
+            else:
+                console.print(f"[yellow]   ⚠ No Claude Code history found at {target}[/yellow]")
+        except Exception as e:
+            console.print(f"[red]   ✗ Ingest failed: {e}[/red]")
+    else:
+        console.print("[dim]1/5[/dim] Skipping ingest")
+
+    # 2. Hook install (auto-ingest future sessions)
+    console.print("\n[bold]2/5[/bold] Installing SessionEnd hook (auto-ingest future sessions)...")
+    try:
+        _hook_install()
+        console.print("[green]   ✓[/green] Hook installed")
+    except Exception as e:
+        console.print(f"[red]   ✗ Hook install failed: {e}[/red]")
+
+    # 3. Prompt hook (optional)
+    if not skip_prompt_hook:
+        console.print(
+            "\n[bold]3/5[/bold] Installing UserPromptSubmit hook (auto-context injection)..."
+        )
+        try:
+            _prompt_hook_install()
+            console.print("[green]   ✓[/green] Prompt hook installed")
+        except Exception as e:
+            console.print(f"[red]   ✗ Prompt hook install failed: {e}[/red]")
+    else:
+        console.print("\n[dim]3/5[/dim] Skipping prompt hook")
+
+    # 4. MCP install
+    if not skip_mcp:
+        console.print("\n[bold]4/5[/bold] Installing MCP server for Claude Desktop...")
+        try:
+            _mcp_install()
+            console.print("[green]   ✓[/green] MCP server registered")
+        except Exception as e:
+            console.print(f"[red]   ✗ MCP install failed: {e}[/red]")
+        console.print(
+            f"   [dim]Claude Code: run [cyan]{CLAUDE_CODE_MCP_ADD}[/cyan] "
+            "(or install the Longhand plugin).[/dim]"
+        )
+    else:
+        console.print("\n[dim]4/5[/dim] Skipping MCP install")
+
+    # 5. Doctor — verify everything
+    console.print("\n[bold]5/5[/bold] Verifying installation...")
+    _doctor()
+
+    console.print("\n[bold green]→ Setup complete.[/bold green]")
+
+    # Summarize what setup actually built, and suggest queries derived from
+    # the user's own data — a generic hint teaches less than a real one.
+    top_project: str | None = None
+    try:
+        store = _get_store(data_dir)
+        s = store.stats()
+        parts = [f"{s['sessions']:,} sessions"]
+        if s.get("projects"):
+            parts.append(f"{s['projects']:,} projects")
+        if s.get("episodes"):
+            parts.append(f"{s['episodes']:,} episodes")
+        console.print(f"[dim]Indexed: {' · '.join(parts)}[/dim]")
+        projects = store.sqlite.list_projects(limit=1)
+        if projects:
+            top_project = projects[0].get("display_name")
+    except Exception:
+        pass
+
+    console.print('\nTry: [cyan]longhand recall "what was I working on last week"[/cyan]')
+    if top_project:
+        console.print(f'Or:  [cyan]longhand status "{top_project}"[/cyan]')
+    else:
+        console.print("Or:  [cyan]longhand status <project-name>[/cyan]")
+    console.print("Or:  [cyan]longhand status --days 7[/cyan]")
+    console.print(
+        "\n[dim]If Longhand earns its keep, a star helps others find it: "
+        "[/dim][cyan]https://github.com/Wynelson94/longhand[/cyan]"
+    )
+
+
+# -----------------------------------------------------------------------------
+# DEMO — sandboxed walkthrough on a sample corpus
+# -----------------------------------------------------------------------------
+
+
+@app.command(rich_help_panel="Setup & health")
+def demo(
+    keep: bool = typer.Option(
+        False,
+        "--keep",
+        help="Leave the demo corpus + store on disk after the walkthrough so you can explore further. Default: clean up.",
+    ),
+):
+    """Try Longhand on a fake 3-session corpus without touching your real history.
+
+    Creates a sandboxed Longhand store under /tmp/longhand-demo-<timestamp>/,
+    seeds it with 3 fictional Claude Code sessions covering a Stripe webhook
+    bug + auth migration + downstream 401 fix, then runs through `recall` and
+    `recall_project_status` so you can see what the output looks like before
+    pointing Longhand at your own data.
+
+    Your real ~/.longhand and ~/.claude are not modified.
+    """
+    from longhand.demo import run_demo
+
+    run_demo(keep=keep)
+
+
+# -----------------------------------------------------------------------------
+# INGEST
+# -----------------------------------------------------------------------------
+
+
+@app.command("codex-sync", rich_help_panel="Data")
+def codex_sync_cmd(
+    semantic: bool = typer.Option(
+        False,
+        "--semantic",
+        help="Run the full pipeline (embeddings, episodes, project inference) so recall and "
+        "search see these sessions; the default captures exact records only",
+    ),
+    limit: int = typer.Option(
+        DEFAULT_SESSION_LIMIT, "--limit", min=1, help="Maximum sessions imported per scan"
+    ),
+    max_file_kb: int = typer.Option(
+        DEFAULT_MAX_FILE_BYTES // 1024,
+        "--max-file-kb",
+        min=1,
+        help="Defer rollouts larger than this many KiB",
+    ),
+    max_events: int = typer.Option(
+        DEFAULT_MAX_EVENTS, "--max-events", min=1, help="Defer sessions with more events than this"
+    ),
+    include_subagents: bool = typer.Option(
+        False,
+        "--include-subagents",
+        help="Also capture threads Codex spawned for itself (e.g. its approval reviewer); "
+        "skipped by default because they re-quote the parent thread",
+    ),
+    finalize_after: int = typer.Option(
+        DEFAULT_FINALIZE_AFTER_SECONDS,
+        "--finalize-after",
+        min=0,
+        help="Seconds a thread must stay quiet before it gets the full pipeline "
+        "(embeddings, episodes, project inference) so recall and search see it",
+    ),
+    no_finalize: bool = typer.Option(
+        False,
+        "--no-finalize",
+        help="Capture exact records only; never run the full pipeline from this command",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="List rollouts and sizes without opening the archive or loading embeddings",
+    ),
+    codex_home: str | None = typer.Option(
+        None, "--codex-home", help="Codex home (defaults to CODEX_HOME or ~/.codex)"
+    ),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Shared Longhand archive"),
+    watch: bool = typer.Option(
+        False, "--watch", help="Keep importing changed Codex sessions until interrupted"
+    ),
+    interval: int = typer.Option(
+        60, "--interval", min=10, help="Seconds between scans with --watch"
+    ),
+):
+    """Capture Codex history into the same archive Claude uses.
+
+    Two passes, the Codex twin of Claude Code's Stop and SessionEnd hooks:
+    every new or changed rollout is captured exact-record-only (no vector
+    model loaded), then any rollout quiet for --finalize-after seconds gets
+    the full pipeline so recall and search see it. The model loads only when
+    a quiet thread is waiting. `reconcile --fix` runs both passes too, so a
+    scheduled reconciler keeps Codex current on its own; run this directly
+    for an immediate capture, with --watch for a 60-second loop, or with
+    --semantic to run the full pipeline on everything now.
+    """
+    import json
+    import time
+
+    from longhand.codex import (
+        CodexArchiveStore,
+        discover_codex_sessions,
+        finalize_codex,
+        is_subagent_rollout,
+        read_session_meta,
+        sync_codex,
+    )
+
+    if dry_run:
+        for path in discover_codex_sessions(codex_home):
+            size = path.stat().st_size
+            console.print(
+                json.dumps(
+                    {
+                        "path": str(path),
+                        "bytes": size,
+                        "within_size_limit": size <= max_file_kb * 1024,
+                        "subagent": is_subagent_rollout(read_session_meta(path)),
+                    }
+                )
+            )
+        return
+    store = _get_store(data_dir) if semantic else CodexArchiveStore(data_dir)
+    while True:
+        report = sync_codex(
+            store,
+            codex_home,
+            limit=limit,
+            max_file_bytes=max_file_kb * 1024,
+            max_events=max_events,
+            include_subagents=include_subagents,
+        )
+        if not semantic and not no_finalize:
+            finalized = finalize_codex(
+                store.sqlite,
+                codex_home,
+                lambda: _get_store(data_dir),
+                idle_seconds=finalize_after,
+                max_file_bytes=max_file_kb * 1024,
+                max_events=max_events,
+                include_subagents=include_subagents,
+            )
+            report["finalized"] = finalized["finalized"]
+            report["settling"] = finalized["settling"]
+            report["deferred"] = list(dict.fromkeys(report["deferred"] + finalized["deferred"]))
+            report["errors"].extend(finalized["errors"])
+        console.print(json.dumps(report))
+        if not watch:
+            if report["errors"]:
+                raise typer.Exit(1)
+            return
+        time.sleep(interval)
+
+
+@app.command(rich_help_panel="Data")
+def ingest(
+    path: str | None = typer.Argument(
+        None,
+        help="Path to a .jsonl file or directory. Defaults to ~/.claude/projects",
+    ),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Longhand data directory"),
+    force: bool = typer.Option(False, "--force", help="Re-ingest already-indexed files"),
+    limit: int = typer.Option(0, "--limit", help="Max number of sessions to ingest (0 = all)"),
+    skip_analysis: bool = typer.Option(
+        False,
+        "--skip-analysis",
+        help=(
+            "Skip the analysis pass: no episodes, segments, or session/project "
+            "vectors. Events are still stored and embedded. Run "
+            "`longhand analyze --all` afterwards to add the rest."
+        ),
+    ),
+):
+    """Ingest Claude Code session JSONL files into the Longhand store.
+
+    By default every session is indexed and analyzed: SQLite rows plus
+    vector embeddings for events, sessions, projects, segments, and
+    problem→fix episodes. Semantic recall works immediately.
+
+    Pass ``--skip-analysis`` to store and embed events but defer the analysis
+    pass. ``search``, file history, and timelines all work; ``recall`` has no
+    episodes or segments until ``longhand analyze --all`` runs. It shortens a
+    first-time backfill of a multi-GB corpus by the analysis time; the event
+    embeddings still run.
+    """
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+
+    store = _get_store(data_dir)
+
+    # Claim the ingest lock so on-the-fly fallback callers can see that
+    # a full ingest is in progress (and skip spawning another one). If
+    # another live ingest holds the lock, exit cleanly — we're a spawned
+    # duplicate from a fallback-path race, not a user invocation.
+    from longhand.recall.project_fallback import (
+        claim_ingest_lock,
+        release_ingest_lock,
+    )
+
+    if not claim_ingest_lock(store):
+        console.print("[yellow]Another ingest is already running — skipping.[/yellow]")
+        return
+
+    if path:
+        target = Path(path).expanduser()
+        if target.is_file():
+            files = [target]
+        elif target.is_dir():
+            files = discover_sessions(target)
+        else:
+            console.print(f"[red]Path not found: {path}[/red]")
+            release_ingest_lock(store)
+            raise typer.Exit(1)
+    else:
+        files = discover_sessions()
+
+    if not files:
+        console.print("[yellow]No session files found.[/yellow]")
+        console.print("Default location: ~/.claude/projects")
+        release_ingest_lock(store)
+        return
+
+    if limit > 0:
+        files = files[:limit]
+
+    suffix = " (events only, --skip-analysis)" if skip_analysis else ""
+    console.print(f"[cyan]Found {len(files)} session file(s){suffix}[/cyan]")
+
+    ingested = 0
+    skipped = 0
+    events_total = 0
+    errors = 0
+
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False,
+        ) as progress:
+            task = progress.add_task("Ingesting", total=len(files))
+            for file in files:
+                progress.update(task, description=f"Ingesting [dim]{file.name[:40]}[/dim]")
+                try:
+                    file_size = file.stat().st_size
+                    if not force and store.sqlite.already_ingested(str(file), file_size):
+                        skipped += 1
+                        progress.advance(task)
+                        continue
+
+                    parser = JSONLParser(file)
+                    events = list(parser.parse_events())
+                    if not events:
+                        skipped += 1
+                        progress.advance(task)
+                        continue
+
+                    session = parser.build_session(events)
+                    result = store.ingest_session(session, events, run_analysis=not skip_analysis)
+                    events_total += result["events_stored"]
+                    ingested += 1
+                except Exception as e:
+                    errors += 1
+                    progress.console.print(f"  [red]✗[/red] {file.name}: {e}")
+                finally:
+                    progress.advance(task)
+
+        console.print()
+        console.print(
+            f"[bold]Ingested {ingested}[/bold] sessions, "
+            f"[bold]{events_total}[/bold] events "
+            f"([dim]{skipped} skipped, {errors} errors[/dim])"
+        )
+        if skip_analysis and ingested > 0:
+            console.print(
+                "\n[dim]Analysis skipped.[/dim] "
+                "Run [cyan]longhand analyze --all[/cyan] to populate episodes, "
+                "segments, and semantic recall vectors."
+            )
+        elif ingested > 0:
+            console.print(
+                '\n[dim]Next:[/dim] [cyan]longhand recall "what was I working on last week"[/cyan]'
+            )
+    finally:
+        release_ingest_lock(store)
+
+
+# -----------------------------------------------------------------------------
+# RECONCILE — bridge disk↔DB drift
+# -----------------------------------------------------------------------------
+
+
+def _maybe_auto_backup(store: LonghandStore) -> None:
+    """The scheduled reconciler's backup hook (only when backup.auto is on; at most hourly).
+
+    maybe_auto_backup never raises; the guard here is belt and braces so the
+    reconciler's exit status can never depend on the backup.
+    """
+    try:
+        from longhand.backup.service import maybe_auto_backup
+
+        report = maybe_auto_backup(store.sqlite, store.data_dir)
+    except Exception:
+        return
+    if report is None:
+        return
+    pushed = "pushed" if report.pushed else "not pushed"
+    line = f"[bold]Backup[/bold] {report.added} added, {report.grown} updated, {pushed}"
+    if report.error:
+        line += f" [red]{escape(report.error)}[/red]"
+    console.print(line)
+
+
+@app.command(
+    rich_help_panel="Data",
+    epilog="See also: longhand reattribute — re-derives project ownership for "
+    "sessions already in the database; reconcile re-ingests transcripts that "
+    "never made it in.",
+)
+def reconcile(
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Longhand data directory"),
+    fix: bool = typer.Option(
+        False,
+        "--fix",
+        help="Re-ingest sessions that are missing, partially indexed, or have NULL project_id",
+    ),
+):
+    """Reconcile session transcripts on disk against the sessions table.
+
+    Finds four buckets:
+    - Fully indexed (session row exists, project_id set, analysis completed)
+    - Partially indexed (the ingest pipeline crashed mid-way — events landed
+      but analysis/vectors may be incomplete)
+    - Ingested but project_id IS NULL (project inference failed — often because
+      Claude Code launched from $HOME so the transcript's first-event cwd
+      wasn't a project directory)
+    - Missing from sessions entirely (SessionEnd hook didn't fire, or ingest
+      was skipped)
+
+    By default, only prints a summary. Pass --fix to re-ingest the problem
+    buckets using the current project-inference logic.
+    """
+    from longhand.recall.reconcile import run_reconcile
+
+    store = _get_store(data_dir)
+    report = run_reconcile(store, fix=fix)
+
+    if report.files_on_disk == 0 and report.codex_on_disk == 0:
+        console.print("[yellow]No session files found on disk.[/yellow]")
+        console.print("Default location: ~/.claude/projects (Codex: ~/.codex/sessions)")
+        if fix:
+            _maybe_auto_backup(store)
+        return
+
+    if report.files_on_disk:
+        console.print(f"[bold]On disk:[/bold] {report.files_on_disk} JSONL files")
+        console.print(f"  [green]{report.fully_indexed}[/green] fully indexed")
+        console.print(
+            f"  [yellow]{len(report.partially_indexed)}[/yellow] partially indexed (ingest crashed mid-pipeline)"
+        )
+        console.print(
+            f"  [yellow]{len(report.null_project)}[/yellow] ingested but project_id IS NULL"
+        )
+        console.print(f"  [red]{len(report.missing)}[/red] missing from sessions")
+        if report.skipped_oversize:
+            console.print(
+                f"  [dim]{len(report.skipped_oversize)} skipped — over the parser size cap "
+                "(not ingestable by any path)[/dim]"
+            )
+    else:
+        console.print("[dim]No Claude Code session files on disk.[/dim]")
+
+    if report.codex_on_disk:
+        current = (
+            report.codex_on_disk
+            - report.codex_pending
+            - report.codex_skipped_subagents
+            - report.codex_oversize
+        )
+        console.print(f"[bold]Codex rollouts:[/bold] {report.codex_on_disk} on disk")
+        console.print(f"  [green]{current}[/green] captured and current")
+        console.print(f"  [yellow]{report.codex_pending}[/yellow] new or changed since capture")
+        if report.codex_unfinalized:
+            console.print(
+                f"  [yellow]{report.codex_unfinalized}[/yellow] quiet thread(s) awaiting the "
+                "full pipeline"
+            )
+        if report.codex_settling:
+            console.print(
+                f"  [dim]{report.codex_settling} still being written (finalized once quiet)[/dim]"
+            )
+        if report.codex_skipped_subagents:
+            console.print(
+                f"  [dim]{report.codex_skipped_subagents} subagent thread(s) skipped "
+                "(longhand codex-sync --include-subagents to capture them)[/dim]"
+            )
+        if report.codex_oversize:
+            console.print(
+                f"  [dim]{report.codex_oversize} over the capture size bound "
+                "(longhand codex-sync --max-file-kb to raise it)[/dim]"
+            )
+
+    fixable_claude = bool(report.missing or report.null_project or report.partially_indexed)
+    fixable_codex = bool(report.codex_pending or report.codex_unfinalized)
+    if not fix:
+        if fixable_claude or fixable_codex:
+            console.print("\n[dim]Run with --fix to re-ingest.[/dim]")
+        return
+
+    if report.lock_unavailable:
+        console.print("[yellow]Another ingest is running — aborting reconcile.[/yellow]")
+        raise typer.Exit(1)
+
+    if not fixable_claude and not fixable_codex:
+        console.print("\n[green]Nothing to fix.[/green]")
+        _maybe_auto_backup(store)
+        return
+
+    n_fixable = len(report.missing) + len(report.null_project) + len(report.partially_indexed)
+    if n_fixable:
+        console.print(f"\n[cyan]Re-ingesting {n_fixable} file(s)...[/cyan]")
+    for err in report.errors:
+        console.print(f"  [red]✗[/red] {Path(err['path']).name}: {err['error']}")
+    console.print(
+        f"\n[bold]Re-ingested {report.ingested}[/bold] ([dim]{len(report.errors)} errors[/dim])"
+    )
+    if report.codex_on_disk:
+        deferred = (
+            f" ([dim]{len(report.codex_deferred)} deferred[/dim])" if report.codex_deferred else ""
+        )
+        console.print(f"[bold]Captured {report.codex_ingested}[/bold] Codex rollout(s){deferred}")
+        settling = (
+            f" ([dim]{report.codex_settling} settling[/dim])" if report.codex_settling else ""
+        )
+        console.print(f"[bold]Finalized {report.codex_finalized}[/bold] Codex thread(s){settling}")
+    _maybe_auto_backup(store)
+
+
+# -----------------------------------------------------------------------------
+# SESSIONS
+# -----------------------------------------------------------------------------
+
+
+@app.command(rich_help_panel="Browse & insights")
+def sessions(
+    project: str | None = typer.Option(None, "--project", help="Filter by project path substring"),
+    limit: int = typer.Option(20, "--limit", help="Max sessions to show"),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """List ingested sessions."""
+    store = _get_store(data_dir)
+    rows = store.sqlite.list_sessions(project_path=project, limit=limit)
+
+    if not rows:
+        console.print("[yellow]No sessions found. Run `longhand ingest` first.[/yellow]")
+        return
+
+    table = Table(title=f"Longhand Sessions ({len(rows)})", show_lines=False)
+    table.add_column("Session ID", style="cyan", no_wrap=True)
+    table.add_column("Started", style="dim")
+    table.add_column("Events", justify="right")
+    table.add_column("Edits", justify="right")
+    table.add_column("Model", style="magenta")
+    table.add_column("Project", style="green", overflow="fold")
+
+    for row in rows:
+        table.add_row(
+            row["session_id"][:8],
+            _format_timestamp(row["started_at"]),
+            str(row["event_count"]),
+            str(row["file_edit_count"]),
+            (row.get("model") or "—")[:16],
+            (row.get("project_path") or "—")[-50:],
+        )
+
+    console.print(table)
+
+
+# -----------------------------------------------------------------------------
+# SEARCH
+# -----------------------------------------------------------------------------
+
+
+@app.command(rich_help_panel="Recall")
+def search(
+    query: str = typer.Argument(..., help="Semantic query text"),
+    limit: int = typer.Option(10, "--limit", "-n"),
+    event_type: str | None = typer.Option(
+        None,
+        "--type",
+        help="Filter: user_message, assistant_text, assistant_thinking, tool_call, tool_result",
+    ),
+    session: str | None = typer.Option(
+        None, "--session", help="Filter by session id (prefix match)"
+    ),
+    tool: str | None = typer.Option(
+        None, "--tool", help="Filter by tool name (Edit, Bash, Read, etc.)"
+    ),
+    file: str | None = typer.Option(None, "--file", help="Filter by file path substring"),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Semantic search across all stored events."""
+    store = _get_store(data_dir)
+
+    # Resolve session prefix to full id if provided
+    resolved_session = None
+    if session:
+        rows = store.sqlite.list_sessions(limit=1000)
+        for r in rows:
+            if r["session_id"].startswith(session):
+                resolved_session = r["session_id"]
+                break
+
+    hits = store.vectors.search(
+        query=query,
+        n_results=limit,
+        event_type=event_type,
+        session_id=resolved_session,
+        tool_name=tool,
+        file_path_contains=file,
+    )
+
+    if not hits:
+        console.print("[yellow]No results.[/yellow]")
+        return
+
+    for i, hit in enumerate(hits, start=1):
+        meta = hit["metadata"]
+        distance = hit["distance"]
+        relevance = max(0.0, 1.0 - distance)
+
+        header = Text()
+        header.append(f"[{i}] ", style="bold cyan")
+        header.append(f"{meta.get('event_type', '?')} ", style="yellow")
+        if meta.get("tool_name"):
+            header.append(f"({meta['tool_name']}) ", style="magenta")
+        header.append(f"{_format_timestamp(meta.get('timestamp', ''))} ", style="dim")
+        header.append(f"[{relevance:.2f}]", style="green" if relevance > 0.5 else "dim")
+
+        snippet = hit["document"]
+        if len(snippet) > 400:
+            snippet = snippet[:400] + "..."
+
+        console.print(header)
+        console.print(Panel(snippet, border_style="dim", padding=(0, 1)))
+        console.print(f"  [dim]event_id:[/dim] {hit['event_id']}")
+        if meta.get("file_path"):
+            console.print(f"  [dim]file:[/dim] {meta['file_path']}")
+        console.print()
+
+
+# -----------------------------------------------------------------------------
+# TIMELINE
+# -----------------------------------------------------------------------------
+
+
+@app.command(rich_help_panel="Archaeology")
+def timeline(
+    session_id: str = typer.Argument(..., help="Session ID (prefix match supported)"),
+    limit: int = typer.Option(100, "--limit", "-n"),
+    show_thinking: bool = typer.Option(True, "--thinking/--no-thinking"),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Show a chronological timeline of a session."""
+    store = _get_store(data_dir)
+
+    # Resolve prefix
+    sessions_rows = store.sqlite.list_sessions(limit=1000)
+    full_id = None
+    for row in sessions_rows:
+        if row["session_id"].startswith(session_id):
+            full_id = row["session_id"]
+            break
+
+    if not full_id:
+        console.print(f"[red]No session found matching: {session_id}[/red]")
+        raise typer.Exit(1)
+
+    events = store.sqlite.get_events(session_id=full_id, limit=limit)
+
+    if not events:
+        console.print("[yellow]No events in session.[/yellow]")
+        return
+
+    session_row = store.sqlite.get_session(full_id)
+    if session_row:
+        console.print(
+            Panel.fit(
+                f"[bold]{full_id}[/bold]\n"
+                f"[dim]{session_row.get('project_path') or '—'}[/dim]\n"
+                f"Started: {_format_timestamp(session_row['started_at'])}  "
+                f"Events: {session_row['event_count']}",
+                title="Session",
+                border_style="cyan",
+            )
+        )
+        console.print()
+
+    for e in events:
+        etype = e["event_type"]
+        if not show_thinking and etype == "assistant_thinking":
+            continue
+
+        ts = _format_timestamp(e["timestamp"])
+        marker = _event_marker(etype)
+        content = (e.get("content") or "").strip()
+        if len(content) > 200:
+            content = content[:200] + "..."
+        content = content.replace("\n", " ")
+
+        line = Text()
+        line.append(f"{ts}  ", style="dim")
+        line.append(f"{marker} ", style="bold")
+        if e.get("tool_name"):
+            line.append(f"{e['tool_name']} ", style="magenta")
+        if e.get("file_path"):
+            line.append(f"{Path(e['file_path']).name} ", style="green")
+        line.append(content, style="white")
+
+        console.print(line)
+
+
+def _event_marker(event_type: str) -> str:
+    return {
+        "user_message": "👤",
+        "assistant_text": "💬",
+        "assistant_thinking": "🧠",
+        "tool_call": "🔧",
+        "tool_result": "✓",
+        "file_snapshot": "📸",
+        "system": "⚙",
+    }.get(event_type, "•")
+
+
+# -----------------------------------------------------------------------------
+# REPLAY
+# -----------------------------------------------------------------------------
+
+
+@app.command(rich_help_panel="Archaeology")
+def replay(
+    session_id: str = typer.Argument(..., help="Session ID (prefix match)"),
+    file_path: str = typer.Argument(..., help="File path to reconstruct"),
+    at_event: str | None = typer.Option(
+        None, "--at-event", help="Reconstruct state at this event id"
+    ),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Reconstruct the state of a file at a point in a session."""
+    store = _get_store(data_dir)
+
+    sessions_rows = store.sqlite.list_sessions(limit=1000)
+    full_id = None
+    for row in sessions_rows:
+        if row["session_id"].startswith(session_id):
+            full_id = row["session_id"]
+            break
+    if not full_id:
+        console.print(f"[red]No session matching: {session_id}[/red]")
+        raise typer.Exit(1)
+
+    engine = ReplayEngine(store.sqlite)
+    state = engine.file_state_at(
+        file_path=file_path,
+        session_id=full_id,
+        at_event_id=at_event,
+    )
+
+    if not state:
+        console.print(f"[yellow]No edits found for {file_path} in session {full_id[:8]}[/yellow]")
+        return
+
+    console.print(
+        Panel.fit(
+            f"[bold]{state.file_path}[/bold]\n"
+            f"[dim]Session:[/dim] {state.session_id[:8]}\n"
+            f"[dim]At:[/dim] {state.at_timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"[dim]Source:[/dim] {state.source}\n"
+            f"[dim]Edits applied:[/dim] {state.edits_applied}",
+            title="Reconstructed State",
+            border_style="cyan",
+        )
+    )
+
+    # Syntax-highlight if we can guess the language
+    language = _guess_language(file_path)
+    try:
+        console.print(Syntax(state.content, language, theme="monokai", line_numbers=True))
+    except Exception:
+        console.print(state.content)
+
+
+def _guess_language(file_path: str) -> str:
+    ext = Path(file_path).suffix.lower()
+    return {
+        ".py": "python",
+        ".ts": "typescript",
+        ".tsx": "tsx",
+        ".js": "javascript",
+        ".jsx": "jsx",
+        ".go": "go",
+        ".rs": "rust",
+        ".rb": "ruby",
+        ".java": "java",
+        ".sql": "sql",
+        ".md": "markdown",
+        ".json": "json",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".html": "html",
+        ".css": "css",
+        ".sh": "bash",
+        ".toml": "toml",
+    }.get(ext, "text")
+
+
+# -----------------------------------------------------------------------------
+# DIFF
+# -----------------------------------------------------------------------------
+
+
+@app.command(rich_help_panel="Archaeology")
+def diff(
+    event_id: str = typer.Argument(..., help="Event ID of an edit"),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Show the before/after content of a single edit event."""
+    store = _get_store(data_dir)
+    engine = ReplayEngine(store.sqlite)
+    result = engine.diff_edit(event_id)
+
+    if not result:
+        console.print(f"[red]No edit event found: {event_id}[/red]")
+        raise typer.Exit(1)
+
+    console.print(
+        Panel.fit(
+            f"[bold]{result['tool_name']}[/bold]  [dim]{result['file_path']}[/dim]",
+            border_style="cyan",
+        )
+    )
+
+    console.print("[red]--- old[/red]")
+    console.print(Panel(result["old"] or "[dim](empty)[/dim]", border_style="red", padding=(0, 1)))
+    console.print("[green]+++ new[/green]")
+    console.print(
+        Panel(result["new"] or "[dim](empty)[/dim]", border_style="green", padding=(0, 1))
+    )
+
+
+# -----------------------------------------------------------------------------
+# STATS
+# -----------------------------------------------------------------------------
+
+
+@app.command(rich_help_panel="Browse & insights")
+def stats(
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Show overall storage statistics."""
+    store = _get_store(data_dir)
+    s = store.stats()
+
+    table = Table(title="Longhand Storage", show_header=False, border_style="cyan")
+    table.add_column("Metric", style="bold")
+    table.add_column("Count", justify="right", style="cyan")
+
+    table.add_row("Sessions", f"{s['sessions']:,}")
+    table.add_row("Events", f"{s['events']:,}")
+    table.add_row("Tool calls", f"{s['tool_calls']:,}")
+    table.add_row("Thinking blocks", f"{s['thinking_blocks']:,}")
+    table.add_row("File edits", f"{s['file_edits']:,}")
+    table.add_row("Vectors indexed", f"{s['vectors_indexed']:,}")
+    if "projects" in s:
+        table.add_row("Projects", f"{s['projects']:,}")
+    if "episodes" in s:
+        table.add_row("Episodes", f"{s['episodes']:,}")
+        resolved = s.get("resolved_episodes", 0)
+        noise = s.get("low_confidence_episodes", 0)
+        unresolved = max(0, s["episodes"] - resolved - noise)
+        table.add_row("  resolved", f"{resolved:,}")
+        table.add_row("  unresolved", f"{unresolved:,}")
+        table.add_row("  low-confidence (likely noise)", f"{noise:,}")
+        if "resolved_rate_pct" in s:
+            table.add_row("Resolved rate", f"{s['resolved_rate_pct']}%")
+    table.add_row("Data directory", str(store.data_dir))
+
+    console.print(table)
+    if s.get("low_confidence_episodes"):
+        console.print(
+            "[dim]Resolved rate excludes low-confidence fixless extractions "
+            "(probes, tool churn) — they are noise, not unsolved problems.[/dim]"
+        )
+
+
+# -----------------------------------------------------------------------------
+# RECALL (proactive memory)
+# -----------------------------------------------------------------------------
+
+
+@app.command(rich_help_panel="Recall")
+def recall(
+    query: str = typer.Argument(..., help="Fuzzy natural-language question about past work"),
+    max_episodes: int = typer.Option(5, "--max", "-n"),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+    show_raw: bool = typer.Option(False, "--raw", help="Also print raw episode data"),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Print the full RecallResult as JSON (same shape the MCP tool returns).",
+    ),
+):
+    """Proactive memory: answer a fuzzy question about past Claude Code work."""
+    store = _get_store(data_dir)
+    result = recall_pipeline(store, query, max_episodes=max_episodes)
+
+    # JSON mode: emit the same payload shape the MCP tool does, so users
+    # can inspect exactly what an agent sees.
+    if as_json:
+        import json as _json
+
+        payload: dict = {
+            "query": result.query,
+            "project_matches": [
+                {
+                    "project_id": m.project_id,
+                    "display_name": m.display_name,
+                    "category": m.category,
+                    "canonical_path": m.canonical_path,
+                    "score": m.score,
+                    "reasons": m.reasons,
+                }
+                for m in result.project_matches
+            ],
+            "time_window": {
+                "since": result.time_window[0].isoformat() if result.time_window[0] else None,
+                "until": result.time_window[1].isoformat() if result.time_window[1] else None,
+            },
+            "episodes": result.episodes,
+            "segments": result.segments,
+            "narrative": result.narrative,
+        }
+        if result.artifacts:
+            payload["artifacts"] = result.artifacts
+        print(_json.dumps(payload, indent=2, default=str))
+        return
+
+    # Show project matches
+    if result.project_matches:
+        pm_lines = []
+        for pm in result.project_matches[:3]:
+            reasons = ", ".join(pm.reasons[:3])
+            pm_lines.append(
+                f"[cyan]{pm.display_name}[/cyan] [dim]({pm.category or '—'}) · {reasons} · {pm.score:.2f}[/dim]"
+            )
+        console.print(Panel("\n".join(pm_lines), title="Project matches", border_style="cyan"))
+
+    # Show time window
+    since, until = result.time_window
+    if since or until:
+        since_str = since.strftime("%Y-%m-%d") if since else "—"
+        until_str = until.strftime("%Y-%m-%d") if until else "now"
+        console.print(f"[dim]Time window:[/dim] {since_str} → {until_str}\n")
+
+    # Narrative
+    console.print(Markdown(result.narrative))
+
+    # Raw
+    if show_raw and result.episodes:
+        console.print()
+        console.print(
+            Panel.fit(f"[bold]{len(result.episodes)} episode(s)[/bold]", border_style="dim")
+        )
+        for ep in result.episodes:
+            console.print(
+                f"  [cyan]{ep['episode_id']}[/cyan]  [dim]{ep.get('ended_at', '')[:16]}[/dim]  confidence={ep.get('confidence', 0):.2f}  status={ep.get('status', '?')}"
+            )
+
+
+# -----------------------------------------------------------------------------
+# ANALYZE (backfill analysis on already-ingested sessions)
+# -----------------------------------------------------------------------------
+
+
+@app.command(rich_help_panel="Data")
+def analyze(
+    all_sessions: bool = typer.Option(False, "--all", help="Re-analyze every ingested session"),
+    session: str | None = typer.Option(
+        None, "--session", help="Re-analyze a single session (prefix match)"
+    ),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Re-run analysis (projects, outcomes, episodes) on already-ingested sessions.
+
+    Holds the ingest lock while it runs: analysis rewrites episodes, segments,
+    and embeddings — the same stores the session hooks write — so hooks defer
+    until it finishes (their reconcile heal path picks up anything deferred).
+    """
+    from longhand.recall.project_fallback import (
+        claim_ingest_lock_with_wait,
+        release_ingest_lock,
+    )
+
+    store = _get_store(data_dir)
+
+    if not all_sessions and not session:
+        console.print("[yellow]Specify --all or --session <id>[/yellow]")
+        raise typer.Exit(1)
+
+    sessions = store.sqlite.list_sessions(limit=10000)
+    if session:
+        sessions = [s for s in sessions if s["session_id"].startswith(session)]
+
+    if not sessions:
+        console.print("[yellow]No matching sessions.[/yellow]")
+        return
+
+    if not claim_ingest_lock_with_wait(
+        store,
+        on_wait=lambda: console.print(
+            "[yellow]Waiting for a running Longhand ingest to finish...[/yellow]"
+        ),
+    ):
+        console.print("[red]✗[/red] Another Longhand ingest is still running — try again shortly.")
+        raise typer.Exit(1)
+
+    try:
+        console.print(f"[cyan]Analyzing {len(sessions)} session(s)...[/cyan]")
+        analyzed = 0
+        errors = 0
+        total_episodes = 0
+
+        fallback_used = 0
+        for sess_row in sessions:
+            try:
+                transcript_path = sess_row["transcript_path"]
+                if transcript_path and Path(transcript_path).exists():
+                    # Re-parse the transcript file for full event objects
+                    parser = JSONLParser(transcript_path)
+                    events = list(parser.parse_events())
+                    if not events:
+                        continue
+                    session_obj = parser.build_session(events)
+                else:
+                    # Transcript rotated off disk — rebuild from the events table
+                    # (the same source reattribute uses), so old sessions still
+                    # get re-analyzed with current extractors.
+                    loaded = store.load_session_from_db(sess_row)
+                    if loaded is None:
+                        errors += 1
+                        continue
+                    session_obj, events = loaded
+                    fallback_used += 1
+                result = store.analyze_session(session_obj, events)
+                total_episodes += result.get("episodes", 0)
+                analyzed += 1
+                if analyzed % 20 == 0:
+                    console.print(f"  [dim]{analyzed}/{len(sessions)}...[/dim]")
+            except Exception as e:
+                errors += 1
+                console.print(f"  [red]✗[/red] {sess_row['session_id'][:8]}: {e}")
+
+        console.print()
+        console.print(
+            f"[bold]Analyzed {analyzed}[/bold] sessions, "
+            f"[bold]{total_episodes}[/bold] episodes "
+            f"([dim]{errors} errors; {fallback_used} rebuilt from the events table[/dim])"
+        )
+
+        # A full re-analysis can shift episode boundaries, leaving stale
+        # embeddings under old episode_ids. Clear and rebuild the collection
+        # from the now-current SQLite rows (formerly `reanalyze`'s job).
+        if all_sessions:
+            console.print("\n[cyan]Rebuilding episode embeddings...[/cyan]")
+            try:
+                store.vectors.client.delete_collection(name="episodes")
+                store.vectors.episodes_collection = store.vectors.client.get_or_create_collection(
+                    name="episodes"
+                )
+            except Exception:
+                pass
+
+            def _progress(done: int, total: int) -> None:
+                console.print(f"   {done}/{total}...", end="\r")
+
+            embedded = store.backfill_episode_embeddings(progress=_progress)
+            console.print(f"[green]✓[/green] Embedded {embedded} episode(s).")
+    finally:
+        release_ingest_lock(store)
+
+
+@app.command(
+    rich_help_panel="Data",
+    epilog="See also: longhand reconcile — re-ingests transcripts missing from "
+    "the database; reattribute re-derives project ownership for sessions "
+    "already in it.",
+)
+def reattribute(
+    fix: bool = typer.Option(
+        False,
+        "--fix",
+        help="Apply the moves. Without it, print what would change (dry-run).",
+    ),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Repair project misattribution.
+
+    Re-derives each session's project from its events in the database (not the
+    transcript file, which may have been rotated away). Fixes sessions that
+    drifted to the wrong project — the home catch-all, monorepo splits,
+    case-duplicate paths, and junk projects minted from temp dirs. Idempotent.
+
+    DRY-RUN BY DEFAULT: prints the moves grouped by destination and touches
+    nothing. Review, then re-run with --fix to apply. --fix holds the ingest
+    lock while it rewrites; the dry-run stays lock-free.
+    """
+    from longhand.recall.project_fallback import (
+        claim_ingest_lock_with_wait,
+        release_ingest_lock,
+    )
+
+    store = _get_store(data_dir)
+
+    if fix and not claim_ingest_lock_with_wait(
+        store,
+        on_wait=lambda: console.print(
+            "[yellow]Waiting for a running Longhand ingest to finish...[/yellow]"
+        ),
+    ):
+        console.print("[red]✗[/red] Another Longhand ingest is still running — try again shortly.")
+        raise typer.Exit(1)
+
+    try:
+        mode = "Re-attributing" if fix else "Dry-run: re-deriving"
+        console.print(f"[cyan]{mode} sessions from the events table...[/cyan]")
+        result = store.reattribute_sessions(apply=fix)
+        console.print(
+            f"[bold]Scanned {result['scanned']}[/bold] sessions, "
+            f"[bold]{result['reattributed']}[/bold] "
+            f"{'re-attributed' if fix else 'would move'} "
+            f"([dim]{result['skipped']} skipped — no events[/dim])"
+        )
+
+        if result["changes"]:
+            by_move: dict[tuple[str | None, str], int] = {}
+            names: dict[str, str] = {}
+            for c in result["changes"]:
+                key = (c["old_project_id"], c["new_project_id"])
+                by_move[key] = by_move.get(key, 0) + 1
+                names[c["new_project_id"]] = c["new_display_name"]
+            for (old_pid, new_pid), n in sorted(by_move.items(), key=lambda kv: -kv[1]):
+                old_proj = store.sqlite.get_project(old_pid) if old_pid else None
+                old_name = (old_proj or {}).get("display_name") or old_pid or "(none)"
+                console.print(f"  {n:>4} session(s): {old_name} → {names[new_pid]}")
+
+        if result["pruned"]:
+            verb = "pruned" if fix else "would be pruned"
+            console.print(f"  [dim]{result['pruned']} emptied project row(s) {verb}[/dim]")
+
+        if not fix and result["changes"]:
+            console.print("\n[dim]Run with --fix to apply.[/dim]")
+    finally:
+        if fix:
+            release_ingest_lock(store)
+
+
+# -----------------------------------------------------------------------------
+# PROJECTS
+# -----------------------------------------------------------------------------
+
+
+@app.command(rich_help_panel="Browse & insights")
+def projects(
+    keyword: str | None = typer.Option(None, "--keyword", "-k"),
+    category: str | None = typer.Option(None, "--category", "-c"),
+    limit: int = typer.Option(50, "--limit"),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """List inferred projects."""
+    store = _get_store(data_dir)
+    rows = store.sqlite.list_projects(keyword=keyword, category=category, limit=limit)
+
+    if not rows:
+        console.print("[yellow]No projects found. Run `longhand analyze --all` first.[/yellow]")
+        return
+
+    table = Table(title=f"Longhand Projects ({len(rows)})", show_lines=False)
+    table.add_column("Project", style="cyan", no_wrap=True)
+    table.add_column("Category", style="magenta")
+    table.add_column("Sessions", justify="right")
+    table.add_column("Edits", justify="right")
+    table.add_column("Last seen", style="dim")
+    table.add_column("Path", style="green", overflow="fold")
+
+    for row in rows:
+        table.add_row(
+            row["display_name"][:30],
+            row.get("category") or "—",
+            str(row["session_count"]),
+            str(row["total_edits"]),
+            _format_timestamp(row["last_seen"]),
+            row["canonical_path"][-50:],
+        )
+
+    console.print(table)
+
+
+# -----------------------------------------------------------------------------
+# PLANS — every Write/Edit to ~/.claude/plans/*.md across all sessions
+# -----------------------------------------------------------------------------
+
+
+plans_app = typer.Typer(name="plans", help="Plan files written across all sessions")
+app.add_typer(plans_app, name="plans", rich_help_panel="Plumbing")
+
+
+# -----------------------------------------------------------------------------
+# DB MAINTENANCE
+# -----------------------------------------------------------------------------
+
+db_app = typer.Typer(name="db", help="Storage maintenance (opt-in, never automatic)")
+
+
+@db_app.command("vacuum")
+def db_vacuum(
+    prune_aux: bool = typer.Option(
+        False,
+        "--prune-aux",
+        help=(
+            "First delete stored aux/unknown events (harness orchestration "
+            "noise — mode changes, attachments, UI titles). Source JSONLs "
+            "remain the recovery path."
+        ),
+    ),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Reclaim disk space from the SQLite store.
+
+    VACUUM rewrites the whole database file, so it needs free disk at least
+    the size of the current DB and must not race a concurrent ingest — the
+    command checks both and aborts (exit 1) rather than proceeding unsafely.
+    """
+    import shutil as _shutil
+
+    from longhand.recall.project_fallback import (
+        claim_ingest_lock,
+        release_ingest_lock,
+    )
+
+    store = _get_store(data_dir)
+    db_file = store.data_dir / "longhand.db"
+    if not db_file.exists():
+        console.print("[yellow]No database found — nothing to vacuum.[/yellow]")
+        return
+    before = db_file.stat().st_size
+
+    free = _shutil.disk_usage(str(store.data_dir)).free
+    if free < before:
+        console.print(
+            f"[red]✗[/red] Not enough free disk: VACUUM needs ~{before:,} bytes "
+            f"free (a full copy of the DB), only {free:,} available."
+        )
+        raise typer.Exit(1)
+
+    if not claim_ingest_lock(store):
+        console.print("[yellow]Another Longhand ingest is running — try again later.[/yellow]")
+        raise typer.Exit(1)
+
+    try:
+        if prune_aux:
+            with store.sqlite.connect() as conn:
+                cur = conn.execute("DELETE FROM events WHERE event_type = 'unknown'")
+                console.print(f"Pruned [bold]{cur.rowcount:,}[/bold] aux/unknown event(s).")
+
+        # VACUUM must run outside a transaction — plain connection, no
+        # context-manager commit wrapper.
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(str(db_file))
+        try:
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
+    finally:
+        release_ingest_lock(store)
+
+    after = db_file.stat().st_size
+    saved = before - after
+    console.print(
+        f"[green]✓[/green] VACUUM complete: {before:,} → {after:,} bytes "
+        f"([bold]{saved:,}[/bold] reclaimed)."
+    )
+
+
+@plans_app.command("list")
+def plans_list(
+    limit: int = typer.Option(50, "--limit"),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """List every Write/Edit ever made to a `~/.claude/plans/*.md` file."""
+    store = _get_store(data_dir)
+    rows = store.sqlite.list_plans(limit=limit)
+
+    if not rows:
+        console.print("[yellow]No plan files found in ingested sessions.[/yellow]")
+        return
+
+    table = Table(title=f"Plan writes ({len(rows)})", show_lines=False)
+    table.add_column("When", style="dim")
+    table.add_column("Plan", style="cyan", overflow="fold")
+    table.add_column("Bytes", justify="right")
+    table.add_column("Session", style="magenta")
+
+    for row in rows:
+        plan_name = row["file_path"].split("/")[-1]
+        table.add_row(
+            _format_timestamp(row["timestamp"]),
+            plan_name,
+            str(row["bytes"] or 0),
+            row["session_id"][:8],
+        )
+
+    console.print(table)
+
+
+# -----------------------------------------------------------------------------
+# GIT LOG — show git operations from sessions
+
+
+@app.command(rich_help_panel="Archaeology")
+def git_log(
+    session_id: str | None = typer.Argument(
+        None, help="Session ID (prefix match). Shows recent across all sessions if omitted."
+    ),
+    operation: str | None = typer.Option(
+        None, "--type", "-t", help="Filter by operation type (commit, push, etc.)"
+    ),
+    query: str | None = typer.Option(None, "--query", "-q", help="Search commit messages"),
+    limit: int = typer.Option(50, "--limit"),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Show git operations from Claude Code sessions."""
+    store = _get_store(data_dir)
+
+    if query:
+        full_session = None
+        if session_id:
+            full_session = _resolve_prefix(store, session_id)
+        ops = store.sqlite.search_git_operations(
+            query=query, session_id=full_session, operation_type=operation, limit=limit
+        )
+    elif session_id:
+        full_session = _resolve_prefix(store, session_id)
+        if not full_session:
+            console.print(f"[red]No session matching: {session_id}[/red]")
+            return
+        ops = store.sqlite.get_git_operations(
+            session_id=full_session, operation_type=operation, limit=limit
+        )
+    else:
+        # Show recent git operations across all sessions
+        ops = store.sqlite.search_git_operations(query="", operation_type=operation, limit=limit)
+
+    if not ops:
+        console.print("[yellow]No git operations found.[/yellow]")
+        return
+
+    table = Table(title=f"Git Operations ({len(ops)})", show_lines=False)
+    table.add_column("Time", style="dim", no_wrap=True)
+    table.add_column("Op", style="cyan", no_wrap=True)
+    table.add_column("Hash", style="yellow", no_wrap=True)
+    table.add_column("Branch", style="magenta")
+    table.add_column("Message", overflow="fold")
+    table.add_column("Session", style="dim", no_wrap=True)
+
+    for op in ops:
+        table.add_row(
+            _format_timestamp(op["timestamp"]),
+            op["operation_type"],
+            (op.get("commit_hash") or "")[:8],
+            op.get("branch") or "—",
+            (op.get("commit_message") or "")[:60],
+            op["session_id"][:8],
+        )
+
+    console.print(table)
+
+
+# -----------------------------------------------------------------------------
+# CONFIG — view and edit hook configuration
+# -----------------------------------------------------------------------------
+
+
+@app.command(rich_help_panel="Setup & health")
+def config(
+    show: bool = typer.Option(
+        True, "--show/--edit", help="Show current config (default) or open for editing"
+    ),
+    set_key: str | None = typer.Option(
+        None, "--set", help="Set a config key, e.g. --set hook.min_relevance=3.0"
+    ),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """View or edit Longhand configuration.
+
+    Config lives at ~/.longhand/config.json. Supported keys:
+    - hook.min_relevance: minimum score to inject context (default 2.5, higher = less noise)
+    - hook.max_inject_chars: max characters injected per prompt (default 2000)
+    - hook.max_episodes: max episodes to consider (default 2)
+    - hook.enabled: true/false to enable/disable without uninstalling
+    - redact.enabled: true/false — mask secret-shaped strings at ingest (default false)
+    - backup.auto: true/false — let the scheduled reconciler push the backup hourly
+      (enable backups first with `longhand backup init`; backup.enabled/remote/path are
+      written by init)
+    """
+    import json as _json
+
+    config_path = Path.home() / ".longhand" / "config.json"
+
+    if set_key:
+        # Parse key=value
+        if "=" not in set_key:
+            console.print("[red]Use format: --set hook.key=value[/red]")
+            return
+        key_path, value_str = set_key.split("=", 1)
+        parts = key_path.split(".")
+        if len(parts) != 2 or parts[0] not in ("hook", "redact", "backup"):
+            console.print(
+                "[red]Only hook.*, redact.* and backup.* keys are supported. "
+                "E.g. --set hook.min_relevance=3.0, --set redact.enabled=true "
+                "or --set backup.auto=true[/red]"
+            )
+            return
+
+        if parts[0] == "backup" and parts[1] != "auto":
+            console.print(
+                "[red]backup.enabled, backup.remote and backup.path are written by "
+                "longhand backup init, after its consent screen. Here you can set "
+                "backup.auto=true|false (the same switch as longhand backup auto on|off).[/red]"
+            )
+            return
+
+        # Load existing config
+        current: dict = {}
+        if config_path.exists():
+            try:
+                current = _json.loads(config_path.read_text())
+            except Exception:
+                current = {}
+
+        namespace, key = parts
+        if namespace not in current:
+            current[namespace] = {}
+
+        # Parse value type
+        if value_str.lower() in ("true", "false"):
+            current[namespace][key] = value_str.lower() == "true"
+        else:
+            try:
+                current[namespace][key] = float(value_str)
+                if current[namespace][key] == int(current[namespace][key]):
+                    current[namespace][key] = int(current[namespace][key])
+            except ValueError:
+                current[namespace][key] = value_str
+
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(_json.dumps(current, indent=2) + "\n")
+        console.print(f"[green]Set {key_path} = {current[namespace][key]}[/green]")
+        return
+
+    # Show current config
+    from longhand.setup_commands import _load_hook_config
+
+    hook = _load_hook_config()
+
+    table = Table(title="Longhand Hook Config", show_lines=False)
+    table.add_column("Key", style="cyan")
+    table.add_column("Value", style="yellow")
+    table.add_column("Description", style="dim")
+
+    descriptions = {
+        "min_relevance": "Minimum relevance score to inject context (higher = less noise)",
+        "max_inject_chars": "Max characters injected per prompt (controls token usage)",
+        "max_episodes": "Max episodes to consider per query",
+        "enabled": "Whether the prompt hook is active",
+    }
+
+    for k, v in hook.items():
+        table.add_row(f"hook.{k}", str(v), descriptions.get(k, ""))
+
+    from longhand.redaction import redaction_enabled
+
+    table.add_row(
+        "redact.enabled",
+        str(redaction_enabled()),
+        "Mask secret-shaped strings (API keys, tokens) at ingest",
+    )
+
+    from longhand.backup.gitrepo import redact_remote
+    from longhand.backup.service import BackupConfig
+    from longhand.storage.store import resolve_data_dir
+
+    backup_cfg = BackupConfig.load(resolve_data_dir(data_dir))
+    table.add_row(
+        "backup.enabled", str(backup_cfg.enabled), "Git-backed backup of the archive (opt-in)"
+    )
+    table.add_row(
+        "backup.auto", str(backup_cfg.auto), "Hourly pushes from the scheduled reconciler"
+    )
+    table.add_row(
+        "backup.remote",
+        redact_remote(backup_cfg.remote) if backup_cfg.remote else "—",
+        "Where the backup goes (set by backup init)",
+    )
+    table.add_row("backup.path", backup_cfg.path or "—", "The clone (default <data dir>/backup)")
+
+    console.print(table)
+    console.print(f"\n[dim]Config file: {config_path}[/dim]")
+    console.print("[dim]Edit with: longhand config --set hook.min_relevance=3.0[/dim]")
+
+
+# -----------------------------------------------------------------------------
+# REDACT — scan/mask secret-shaped strings in already-ingested data
+# -----------------------------------------------------------------------------
+
+
+# Tables and text columns scanned/redacted by `longhand redact`.
+_REDACT_TABLES: dict[str, tuple[str, list[str]]] = {
+    "events": (
+        "event_id",
+        [
+            "content",
+            "tool_input_json",
+            "tool_output",
+            "old_content",
+            "new_content",
+            "error_snippet",
+            "raw_json",
+        ],
+    ),
+    "episodes": ("episode_id", ["problem_description", "diagnosis_summary", "fix_summary"]),
+    # The table is conversation_segments — a bare "segments" key selected a
+    # nonexistent table, was swallowed by the per-table except, and left ALL
+    # segment text unredacted. topic holds the segment's verbatim first user
+    # message, so it must be scanned too.
+    "conversation_segments": ("segment_id", ["topic", "summary", "keywords_json"]),
+    "session_outcomes": ("session_id", ["summary", "topics_json"]),
+    "git_operations": ("git_op_id", ["commit_message"]),
+}
+
+
+@app.command(rich_help_panel="Data")
+def redact(
+    apply: bool = typer.Option(
+        False, "--apply", help="Mask matches in place (irreversible). Default: scan-only report."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt with --apply"),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Scan the local store for secret-shaped strings; optionally mask them.
+
+    Covers data ingested BEFORE `redact.enabled` was turned on. Scan mode
+    reports pattern names and counts only — never the matched values. With
+    --apply, matches are masked in SQLite and changed vector documents are
+    re-embedded.
+    """
+    from longhand.recall.project_fallback import (
+        claim_ingest_lock_with_wait,
+        release_ingest_lock,
+    )
+    from longhand.redaction import redact_text, scan_text
+
+    store = _get_store(data_dir)
+
+    if apply and not yes:
+        confirmed = typer.confirm(
+            "Masking is irreversible (originals are NOT kept). Continue?", default=False
+        )
+        if not confirmed:
+            console.print("[yellow]Aborted — nothing changed.[/yellow]")
+            return
+
+    # Claim only after the irreversibility confirm — nobody should hold the
+    # writers' lock while staring at a y/N prompt. Scan mode is read-only and
+    # stays lock-free.
+    locked = False
+    if apply:
+        if not claim_ingest_lock_with_wait(
+            store,
+            on_wait=lambda: console.print(
+                "[yellow]Waiting for a running Longhand ingest to finish...[/yellow]"
+            ),
+        ):
+            console.print(
+                "[red]✗[/red] Another Longhand ingest is still running — try again shortly."
+            )
+            raise typer.Exit(1)
+        locked = True
+
+    try:
+        pattern_counts: dict[str, int] = {}
+        rows_touched: dict[str, int] = {}
+
+        with store.sqlite.connect() as conn:
+            for table, (pk, columns) in _REDACT_TABLES.items():
+                try:
+                    rows = conn.execute(
+                        f"SELECT {pk}, {', '.join(columns)} FROM {table}"
+                    ).fetchall()  # noqa: S608 — identifiers are from the hardcoded _REDACT_TABLES map
+                except Exception:
+                    continue  # table may not exist on older schemas
+                touched = 0
+                for row in rows:
+                    updates: dict[str, str] = {}
+                    row_matched = False
+                    for col in columns:
+                        val = row[col]
+                        if not val:
+                            continue
+                        found = scan_text(val)
+                        if not found:
+                            continue
+                        row_matched = True
+                        for name, n in found.items():
+                            pattern_counts[name] = pattern_counts.get(name, 0) + n
+                        if apply:
+                            new_val, _ = redact_text(val)
+                            updates[col] = new_val
+                    if updates:
+                        set_clause = ", ".join(f"{c} = ?" for c in updates)
+                        conn.execute(
+                            f"UPDATE {table} SET {set_clause} WHERE {pk} = ?",  # noqa: S608
+                            (*updates.values(), row[pk]),
+                        )
+                    if row_matched:
+                        touched += 1
+                if touched:
+                    rows_touched[table] = touched
+
+        if not pattern_counts:
+            console.print("[green]No secret-shaped strings found. Store is clean.[/green]")
+            return
+
+        table_out = Table(
+            title="Secrets masked" if apply else "Secrets found (scan only — nothing changed)"
+        )
+        table_out.add_column("Pattern", style="cyan")
+        table_out.add_column("Matches", style="yellow", justify="right")
+        for name in sorted(pattern_counts):
+            table_out.add_row(name, str(pattern_counts[name]))
+        console.print(table_out)
+        for tbl, n in rows_touched.items():
+            console.print(f"[dim]{tbl}: {n} row(s) affected[/dim]")
+
+        if apply:
+            embedded = store.vectors.redact_documents(redact_text)
+            console.print(f"[green]Re-embedded {embedded} vector document(s).[/green]")
+            console.print("[green]Done. Matched values were masked in place.[/green]")
+        else:
+            console.print(
+                "\n[dim]Run `longhand redact --apply` to mask these, and "
+                "`longhand config --set redact.enabled=true` to mask future ingests.[/dim]"
+            )
+    finally:
+        if locked:
+            release_ingest_lock(store)
+
+
+# -----------------------------------------------------------------------------
+# CONTEXT — output relevant past context for hook injection
+# -----------------------------------------------------------------------------
+
+
+@app.command(hidden=True)
+def context(
+    query: str = typer.Argument(..., help="The user's prompt or query"),
+    max_episodes: int = typer.Option(2, "--max", "-n"),
+    min_relevance: float = typer.Option(
+        2.0, "--threshold", help="Minimum rank score to inject context (filters noise)"
+    ),
+    project: str | None = typer.Option(
+        None, "--project", "-p", help="Restrict to a project name or id"
+    ),
+    silent_if_empty: bool = typer.Option(
+        True,
+        "--silent/--always",
+        help="Print nothing when nothing relevant is found (vs. print 'no context')",
+    ),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Output relevant past context for a query in a hook-injectable format.
+
+    Designed to be called from a UserPromptSubmit hook so Claude Code can
+    automatically pull in past context before responding. Returns plain text
+    (no Rich formatting). Returns silently when nothing is relevant enough
+    to inject — avoids polluting prompts with low-quality matches.
+    """
+    import sys
+
+    from longhand.recall import recall as _recall
+
+    store = _get_store(data_dir)
+
+    # Skip very short queries — usually not worth recalling
+    if len(query.strip()) < 10:
+        if not silent_if_empty:
+            print("(query too short for recall)")
+        return
+
+    try:
+        result = _recall(store, query, max_episodes=max_episodes)
+    except Exception as e:
+        # Hooks must never crash the parent process
+        if not silent_if_empty:
+            print(f"(longhand error: {e})", file=sys.stderr)
+        return
+
+    age_gap_note = result.age_gap_note
+
+    # Project filter (post-recall)
+    if project and result.episodes:
+        proj_id = None
+        if project.startswith("p_"):
+            proj_id = project
+        else:
+            matches = store.sqlite.list_projects(keyword=project, limit=5)
+            if matches:
+                proj_id = matches[0]["project_id"]
+        if proj_id:
+            kept = [e for e in result.episodes if e.get("project_id") == proj_id]
+            if len(kept) != len(result.episodes):
+                # The note compared the top match with runner-ups that are gone now.
+                age_gap_note = None
+            result.episodes = kept
+
+    # Quality gate — only inject if we have a strong match
+    if not result.episodes:
+        if not silent_if_empty:
+            print("(no relevant past context)")
+        return
+
+    top = result.episodes[0]
+    confidence = top.get("confidence") or 0.0
+
+    # Compute relevance: high confidence + matching keywords
+    import re as _re
+
+    query_words = set(_re.findall(r"[a-z]{4,}", query.lower()))
+    searchable = " ".join(
+        [
+            top.get("problem_description") or "",
+            top.get("diagnosis_summary") or "",
+            top.get("fix_summary") or "",
+        ]
+    ).lower()
+    keyword_overlap = sum(1 for w in query_words if w in searchable)
+    relevance = keyword_overlap * 1.0 + confidence * 2.0
+
+    if relevance < min_relevance:
+        if not silent_if_empty:
+            print(f"(relevance {relevance:.2f} below threshold {min_relevance})")
+        return
+
+    # Build the injection block — plain text, parseable by humans and AIs
+    lines: list[str] = []
+    lines.append("[Longhand recall — relevant past context]")
+    lines.append("")
+
+    # Project info
+    if top.get("project_id"):
+        proj = store.sqlite.get_project(top["project_id"])
+        if proj:
+            lines.append(f"Project: {proj['display_name']}")
+
+    # Time
+    when = top.get("started_at", "")[:16]
+    lines.append(f"Found in session {top['session_id'][:8]} at {when}")
+    # Issue #82: context injected unasked must not let an old match read as current.
+    if age_gap_note:
+        lines.append(f"Note: {age_gap_note}")
+    lines.append("")
+
+    # Problem
+    if top.get("problem_description"):
+        lines.append("Problem:")
+        lines.append(top["problem_description"][:300].strip())
+        lines.append("")
+
+    # Diagnosis (if we have one)
+    if top.get("diagnosis_summary"):
+        lines.append("Diagnosis:")
+        lines.append(top["diagnosis_summary"][:400].strip())
+        lines.append("")
+
+    # Fix
+    if top.get("fix_summary"):
+        lines.append("Fix:")
+        lines.append(top["fix_summary"][:300])
+        lines.append("")
+
+    # Diff (if available)
+    fix = result.artifacts.get("fix") if result.artifacts else None
+    if fix and (fix.get("old") or fix.get("new")):
+        lines.append("Diff:")
+        old = (fix.get("old") or "").strip()[:600]
+        new = (fix.get("new") or "").strip()[:600]
+        if old:
+            for line in old.split("\n")[:10]:
+                lines.append(f"- {line}")
+        if new:
+            for line in new.split("\n")[:10]:
+                lines.append(f"+ {line}")
+        lines.append("")
+
+    # File reference
+    if fix and fix.get("file_path"):
+        lines.append(f"File: {fix['file_path']}")
+        lines.append("")
+
+    lines.append(f"(Use `longhand export {top['episode_id']}` for full detail.)")
+    lines.append("[end Longhand recall]")
+
+    # Plain print, not rich.console — hooks consume stdout directly
+    print("\n".join(lines))
+
+
+# -----------------------------------------------------------------------------
+# EXPORT — episode or session as standalone markdown
+# -----------------------------------------------------------------------------
+
+
+@app.command(rich_help_panel="Browse & insights")
+def export(
+    target: str = typer.Argument(
+        ...,
+        help="Episode ID (ep_*), session ID (prefix), or shortcut: latest, latest-fix",
+    ),
+    output: str | None = typer.Option(None, "--out", "-o", help="Write to file instead of stdout"),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Export an episode or session as standalone markdown."""
+
+    store = _get_store(data_dir)
+
+    # Resolve shortcut targets
+    if target in ("latest", "latest-fix"):
+        episodes = store.sqlite.query_episodes(
+            status="resolved" if target == "latest-fix" else None,
+            limit=1,
+        )
+        if not episodes:
+            console.print("[red]No episodes found.[/red]")
+            raise typer.Exit(1)
+        target = episodes[0]["episode_id"]
+
+    # Episode export
+    if target.startswith("ep_"):
+        ep = store.sqlite.get_episode(target)
+        if not ep:
+            console.print(f"[red]No episode: {target}[/red]")
+            raise typer.Exit(1)
+
+        md = _episode_to_markdown(store, ep)
+
+        if output:
+            Path(output).write_text(md)
+            console.print(f"[green]✓[/green] Exported to {output}")
+        else:
+            console.print(Markdown(md))
+        return
+
+    # Session export — prefix match
+    sessions_rows = store.sqlite.list_sessions(limit=1000)
+    full_id = None
+    for row in sessions_rows:
+        if row["session_id"].startswith(target):
+            full_id = row["session_id"]
+            break
+
+    if not full_id:
+        console.print(f"[red]No episode or session matching: {target}[/red]")
+        raise typer.Exit(1)
+
+    md = _session_to_markdown(store, full_id)
+
+    if output:
+        Path(output).write_text(md)
+        console.print(f"[green]✓[/green] Exported to {output}")
+    else:
+        console.print(Markdown(md))
+
+
+def _episode_to_markdown(store, ep: dict) -> str:
+    """Render an episode as a self-contained markdown document."""
+    import json as _json
+
+    lines: list[str] = []
+
+    # Header
+    lines.append(f"# Episode: {ep['episode_id']}")
+    lines.append("")
+
+    # Project
+    if ep.get("project_id"):
+        proj = store.sqlite.get_project(ep["project_id"])
+        if proj:
+            lines.append(
+                f"**Project:** {proj['display_name']} ({proj.get('category') or 'uncategorized'})"
+            )
+            lines.append(f"**Path:** `{proj['canonical_path']}`")
+
+    lines.append(f"**Session:** `{ep['session_id'][:8]}`")
+    lines.append(f"**Started:** {ep.get('started_at', '')}")
+    lines.append(f"**Ended:** {ep.get('ended_at', '')}")
+    lines.append(f"**Status:** {ep.get('status', 'unknown')}")
+    lines.append(f"**Confidence:** {ep.get('confidence', 0):.2f}")
+    lines.append("")
+
+    # Problem
+    if ep.get("problem_description"):
+        lines.append("## What went wrong")
+        lines.append("")
+        lines.append(ep["problem_description"].strip())
+        lines.append("")
+
+    # Diagnosis
+    if ep.get("diagnosis_summary"):
+        lines.append("## Diagnosis (verbatim thinking block)")
+        lines.append("")
+        lines.append("```")
+        lines.append(ep["diagnosis_summary"].strip())
+        lines.append("```")
+        lines.append("")
+
+    # Fix
+    fix_id = ep.get("fix_event_id")
+    if fix_id:
+        fix_event = store.sqlite.get_event(fix_id)
+        if fix_event:
+            lines.append("## The fix")
+            lines.append("")
+            lines.append(f"**File:** `{fix_event.get('file_path') or '?'}`")
+            lines.append(f"**Tool:** `{fix_event.get('tool_name') or '?'}`")
+            lines.append("")
+            lines.append("```diff")
+            old_lines = (fix_event.get("old_content") or "").splitlines() or [""]
+            new_lines = (fix_event.get("new_content") or "").splitlines() or [""]
+            for line in old_lines:
+                lines.append(f"- {line}")
+            for line in new_lines:
+                lines.append(f"+ {line}")
+            lines.append("```")
+            lines.append("")
+
+            # Reconstructed file state
+            from longhand.replay import ReplayEngine
+
+            engine = ReplayEngine(store.sqlite)
+            try:
+                state = engine.file_state_at(
+                    file_path=fix_event["file_path"],
+                    session_id=ep["session_id"],
+                    at_event_id=fix_id,
+                )
+                if state and state.content:
+                    lines.append("## File state after the fix")
+                    lines.append("")
+                    ext = Path(fix_event["file_path"]).suffix.lstrip(".") or "text"
+                    lines.append(f"```{ext}")
+                    lines.append(state.content)
+                    lines.append("```")
+                    lines.append("")
+            except Exception:
+                pass
+
+    # Verification
+    if ep.get("verification_event_id"):
+        lines.append("## Verification")
+        lines.append("")
+        lines.append("✓ A test or command succeeded after the fix.")
+        lines.append("")
+
+    # Touched files
+    if ep.get("touched_files_json"):
+        try:
+            touched = _json.loads(ep["touched_files_json"])
+            if touched:
+                lines.append("## Touched files")
+                lines.append("")
+                for f in touched:
+                    lines.append(f"- `{f}`")
+                lines.append("")
+        except Exception:
+            pass
+
+    lines.append("---")
+    lines.append("*Exported from Longhand*")
+
+    return "\n".join(lines)
+
+
+def _session_to_markdown(store, session_id: str) -> str:
+    """Render a session timeline as markdown."""
+
+    lines: list[str] = []
+    session = store.sqlite.get_session(session_id)
+    if not session:
+        return f"# Session not found: {session_id}"
+
+    lines.append(f"# Session: {session_id[:8]}")
+    lines.append("")
+
+    if session.get("project_id"):
+        proj = store.sqlite.get_project(session["project_id"])
+        if proj:
+            lines.append(f"**Project:** {proj['display_name']}")
+            lines.append(f"**Path:** `{proj['canonical_path']}`")
+
+    lines.append(f"**Started:** {session.get('started_at', '')}")
+    lines.append(f"**Ended:** {session.get('ended_at', '')}")
+    lines.append(f"**Events:** {session.get('event_count', 0)}")
+
+    outcome = store.sqlite.get_outcome(session_id)
+    if outcome:
+        lines.append(f"**Outcome:** {outcome['outcome']} ({outcome.get('confidence', 0):.2f})")
+    lines.append("")
+
+    # Episodes
+    eps = store.sqlite.query_episodes(session_id=session_id, limit=50)
+    if eps:
+        lines.append(f"## Episodes ({len(eps)})")
+        lines.append("")
+        for ep in eps:
+            status = ep.get("status", "?")
+            problem = (ep.get("problem_description") or "")[:100]
+            lines.append(f"- **{status}** — {problem}")
+        lines.append("")
+
+    # Timeline (visible events only)
+    all_events = store.sqlite.get_events(session_id=session_id, limit=10000)
+    visible = [
+        e
+        for e in all_events
+        if e["event_type"] in ("user_message", "assistant_text", "tool_call", "tool_result")
+    ]
+
+    lines.append(f"## Timeline ({len(visible)} events)")
+    lines.append("")
+
+    for e in visible:
+        etype = e["event_type"]
+        ts = e["timestamp"][:16] if e.get("timestamp") else ""
+
+        if etype == "user_message":
+            content = (e.get("content") or "").strip()[:300]
+            lines.append(f"**{ts}** USER")
+            lines.append("")
+            lines.append(f"> {content}")
+            lines.append("")
+        elif etype == "assistant_text":
+            content = (e.get("content") or "").strip()[:300]
+            lines.append(f"**{ts}** CLAUDE")
+            lines.append("")
+            lines.append(content)
+            lines.append("")
+        elif etype == "tool_call":
+            tool = e.get("tool_name") or "?"
+            file_path = e.get("file_path") or ""
+            extra = f" `{Path(file_path).name}`" if file_path else ""
+            lines.append(f"**{ts}** 🔧 {tool}{extra}")
+            lines.append("")
+        elif etype == "tool_result":
+            status_marker = "❌" if e.get("error_detected") else "✓"
+            lines.append(f"**{ts}** {status_marker}")
+            if e.get("error_detected") and e.get("error_snippet"):
+                lines.append(f"> {e['error_snippet'][:200]}")
+            lines.append("")
+
+    lines.append("---")
+    lines.append("*Exported from Longhand*")
+    return "\n".join(lines)
+
+
+# -----------------------------------------------------------------------------
+# RECAP — what have I been working on recently
+# -----------------------------------------------------------------------------
+
+
+def _recap_digest(
+    store,
+    days: int,
+    limit: int,
+    project: str | None,
+    json_out: bool = False,
+) -> None:
+    """Recent-work digest — the body behind bare `status` (and the deprecated
+    `recap` alias until it is removed at 1.0)."""
+    import json as _json
+    from datetime import timedelta, timezone
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    # Resolve project name to id if provided
+    project_id = None
+    if project:
+        if project.startswith("p_"):
+            project_id = project
+        else:
+            matches = store.sqlite.list_projects(keyword=project, limit=5)
+            if matches:
+                project_id = matches[0]["project_id"]
+
+    sessions = store.sqlite.list_sessions(
+        project_id=project_id,
+        since=since,
+        limit=limit * 2,
+    )
+
+    if not sessions:
+        if json_out:
+            print(_json.dumps({"mode": "digest", "days": days, "sessions": []}))
+            return
+        console.print(
+            f"[yellow]No sessions in the last {days} days"
+            + (f" for project '{project}'" if project else "")
+            + ".[/yellow]"
+        )
+        return
+
+    sessions = sessions[:limit]
+
+    entries: list[dict] = []
+    for s in sessions:
+        sid = s["session_id"]
+        outcome = store.sqlite.get_outcome(sid)
+
+        # Get project info if available
+        project_name = "—"
+        if s.get("project_id"):
+            proj = store.sqlite.get_project(s["project_id"])
+            if proj:
+                project_name = proj["display_name"]
+
+        # Get the first real user message
+        user_events = store.sqlite.get_events(session_id=sid, event_type="user_message", limit=3)
+        first_user_msg = ""
+        for ue in user_events:
+            content = (ue.get("content") or "").strip()
+            if content and not content.startswith("<"):
+                first_user_msg = content[:150]
+                break
+
+        # Episode count for this session
+        eps = store.sqlite.query_episodes(session_id=sid, limit=100)
+
+        topics: list[str] = []
+        if outcome and outcome.get("topics_json"):
+            try:
+                topics = _json.loads(outcome["topics_json"])[:5]
+            except Exception:
+                pass
+
+        entries.append(
+            {
+                "session_id": sid,
+                "started_at": s["started_at"],
+                "outcome": outcome["outcome"] if outcome else None,
+                "project": project_name,
+                "episodes_total": len(eps),
+                "episodes_resolved": sum(1 for e in eps if e.get("status") == "resolved"),
+                "first_user_message": first_user_msg,
+                "topics": topics,
+            }
+        )
+
+    if json_out:
+        print(_json.dumps({"mode": "digest", "days": days, "sessions": entries}, indent=2))
+        return
+
+    header_title = f"Status — last {days} days"
+    if project:
+        header_title += f" · {project}"
+    console.print(Panel.fit(f"[bold]{header_title}[/bold]", border_style="cyan"))
+    console.print()
+
+    for entry in entries:
+        outcome_str = entry["outcome"] or "—"
+        outcome_color = {
+            "shipped": "green",
+            "fixed": "green",
+            "stuck": "red",
+            "abandoned": "dim",
+            "exploratory": "blue",
+        }.get(outcome_str, "white")
+
+        header = Text()
+        header.append(f"{_format_timestamp(entry['started_at'])}  ", style="dim")
+        header.append(f"{entry['session_id'][:8]}  ", style="cyan")
+        header.append(f"[{outcome_str}]", style=outcome_color)
+        header.append(f"  {entry['project']}", style="magenta")
+        if entry["episodes_total"]:
+            header.append(
+                f"  {entry['episodes_resolved']}/{entry['episodes_total']} episodes",
+                style="yellow",
+            )
+        console.print(header)
+
+        if entry["first_user_message"]:
+            console.print(f"  [dim]>[/dim] {entry['first_user_message']}")
+
+        if entry["topics"]:
+            console.print(f"  [dim]topics:[/dim] {', '.join(entry['topics'])}")
+
+        console.print()
+
+
+# -----------------------------------------------------------------------------
+# STATUS — project status with git context
+# -----------------------------------------------------------------------------
+
+
+@app.command("status", rich_help_panel="Recall")
+def status_cmd(
+    project: str | None = typer.Argument(
+        None, help="Project name (fuzzy match) — where that project left off"
+    ),
+    session: str | None = typer.Option(
+        None, "--session", "-s", help="Session ID prefix — resume one session"
+    ),
+    days: int = typer.Option(7, "--days", "-d", help="Digest window for bare `status`"),
+    limit: int = typer.Option(10, "--limit", "-n", help="Digest session cap for bare `status`"),
+    digest_project: str | None = typer.Option(
+        None, "--project", "-p", help="Filter the bare-status digest by project"
+    ),
+    events: int = typer.Option(10, "--events", help="Events to show with --session"),
+    commits: int = typer.Option(10, "--commits", "-c", help="Max recent commits (project mode)"),
+    episodes: int = typer.Option(5, "--episodes", "-e", help="Max recent episodes (project mode)"),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output"),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Where things stand — the single resume command (git-status shape).
+
+    Bare `status`: recent-work digest. `status <project>`: where that project
+    left off (commits, issues, context). `status --session <prefix>`: the tail
+    of one session so you can pick up where you left off.
+    """
+    import json as _json
+
+    if project and session:
+        console.print("[red]Pass a project OR --session, not both.[/red]")
+        raise typer.Exit(2)
+
+    store = _get_store(data_dir)
+
+    if session:
+        _session_tail(store, session, events, json_out=json_out)
+        return
+
+    if project:
+        from longhand.recall.recall_pipeline import recall_project_status
+
+        result = recall_project_status(
+            store,
+            project,
+            max_commits=commits,
+            max_episodes=episodes,
+        )
+        if not result:
+            console.print(f"[red]No project matching: {project}[/red]")
+            raise typer.Exit(1)
+
+        if json_out:
+            import dataclasses
+
+            try:
+                payload: dict = dataclasses.asdict(result)
+            except TypeError:
+                payload = {"narrative": result.narrative}
+            print(_json.dumps({"mode": "project", **payload}, indent=2, default=str))
+            return
+        console.print(Markdown(result.narrative))
+        return
+
+    _recap_digest(store, days, limit, digest_project, json_out=json_out)
+
+
+# -----------------------------------------------------------------------------
+# CONTINUE — pick up where you left off in a session
+# -----------------------------------------------------------------------------
+
+
+def _session_tail(store, session_id: str, n: int, json_out: bool = False) -> None:
+    """Tail one session — the body behind `status --session` (and the
+    deprecated `continue` alias until it is removed at 1.0)."""
+
+    sessions_rows = store.sqlite.list_sessions(limit=1000)
+    full_id = None
+    session_row = None
+    for row in sessions_rows:
+        if row["session_id"].startswith(session_id):
+            full_id = row["session_id"]
+            session_row = row
+            break
+
+    if not full_id or not session_row:
+        console.print(f"[red]No session matching: {session_id}[/red]")
+        raise typer.Exit(1)
+
+    # Session header
+    project_name = "—"
+    if session_row.get("project_id"):
+        proj = store.sqlite.get_project(session_row["project_id"])
+        if proj:
+            project_name = proj["display_name"]
+
+    outcome = store.sqlite.get_outcome(full_id)
+
+    # Grab all events then take the last n (excluding thinking for readability)
+    all_events = store.sqlite.get_events(session_id=full_id, limit=10000)
+    visible_events = [
+        e
+        for e in all_events
+        if e["event_type"] not in ("assistant_thinking", "file_snapshot", "system")
+    ]
+    recent = visible_events[-n:]
+
+    if json_out:
+        import json as _json
+
+        print(
+            _json.dumps(
+                {
+                    "mode": "session",
+                    "session": dict(session_row),
+                    "project": project_name,
+                    "outcome": dict(outcome) if outcome else None,
+                    "events": [dict(e) for e in recent],
+                },
+                indent=2,
+                default=str,
+            )
+        )
+        return
+
+    header_lines = [
+        f"[bold]{full_id}[/bold]",
+        f"[dim]Project:[/dim] {project_name}",
+        f"[dim]Started:[/dim] {_format_timestamp(session_row['started_at'])}",
+        f"[dim]Ended:[/dim] {_format_timestamp(session_row['ended_at'])}",
+        f"[dim]Events:[/dim] {session_row['event_count']}",
+    ]
+    if outcome:
+        header_lines.append(f"[dim]Outcome:[/dim] {outcome['outcome']}")
+    console.print(Panel.fit("\n".join(header_lines), title="Session", border_style="cyan"))
+    console.print()
+
+    if not recent:
+        console.print("[yellow]No visible events in session.[/yellow]")
+        return
+
+    console.print(f"[bold]Last {len(recent)} event(s):[/bold]\n")
+
+    for e in recent:
+        etype = e["event_type"]
+        ts = _format_timestamp(e["timestamp"])
+        marker = _event_marker(etype)
+
+        content = (e.get("content") or "").strip()
+
+        if etype == "user_message":
+            console.print(f"[dim]{ts}[/dim] {marker} [bold blue]USER[/bold blue]")
+            preview = content[:400]
+            console.print(f"  {preview}")
+        elif etype == "assistant_text":
+            console.print(f"[dim]{ts}[/dim] {marker} [bold green]CLAUDE[/bold green]")
+            preview = content[:400]
+            console.print(f"  {preview}")
+        elif etype == "tool_call":
+            tool = e.get("tool_name") or "?"
+            file_path = e.get("file_path") or ""
+            desc = f"{tool}"
+            if file_path:
+                desc += f" {Path(file_path).name}"
+            console.print(f"[dim]{ts}[/dim] {marker} [magenta]{desc}[/magenta]")
+        elif etype == "tool_result":
+            status = "[red]error[/red]" if e.get("error_detected") else "[green]ok[/green]"
+            console.print(f"[dim]{ts}[/dim] {marker} {status}")
+            if e.get("error_detected") and e.get("error_snippet"):
+                console.print(f"  [red]{e['error_snippet'][:200]}[/red]")
+
+    console.print()
+
+    # Last unresolved question or open episode
+    unresolved_eps = store.sqlite.query_episodes(session_id=full_id, status="unresolved", limit=5)
+    if unresolved_eps:
+        console.print(
+            Panel.fit(
+                f"[yellow]⚠ {len(unresolved_eps)} unresolved episode(s) in this session[/yellow]\n"
+                + "\n".join(
+                    f"  • {(ep.get('problem_description') or '')[:100]}"
+                    for ep in unresolved_eps[:3]
+                ),
+                border_style="yellow",
+            )
+        )
+
+
+# -----------------------------------------------------------------------------
+# HISTORY — cross-session file history
+# -----------------------------------------------------------------------------
+
+
+@app.command(rich_help_panel="Archaeology")
+def history(
+    file_path: str = typer.Argument(..., help="File path (exact or substring match)"),
+    limit: int = typer.Option(50, "--limit"),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Show every edit to a file across all sessions, chronologically."""
+    store = _get_store(data_dir)
+
+    # Try exact match first
+    edits = store.sqlite.get_file_edits(file_path)
+
+    # Fall back to substring match
+    if not edits:
+        events = store.sqlite.get_events(
+            file_path=file_path, event_type="tool_call", limit=limit * 4
+        )
+        edits = [
+            e
+            for e in events
+            if e.get("file_operation") in ("edit", "write", "multi_edit", "notebook_edit")
+        ]
+
+    if not edits:
+        console.print(f"[yellow]No edits found for '{file_path}'[/yellow]")
+        return
+
+    edits = edits[:limit]
+
+    # Group by resolved file path to handle substring matches touching multiple files
+    unique_files = sorted({e.get("file_path") or file_path for e in edits})
+    unique_sessions = len({e["session_id"] for e in edits})
+
+    console.print(
+        Panel.fit(
+            f"[bold]{file_path}[/bold]\n"
+            f"[dim]{len(edits)} edit(s) across "
+            f"{unique_sessions} session(s) · {len(unique_files)} matching file(s)[/dim]",
+            title="File History",
+            border_style="cyan",
+        )
+    )
+
+    last_session: str | None = None
+    last_file: str | None = None
+    for e in edits:
+        session_id = e["session_id"]
+        resolved_file = e.get("file_path") or ""
+
+        if session_id != last_session:
+            console.print()
+            console.print(f"[cyan]Session {session_id[:8]}[/cyan]")
+            last_session = session_id
+            last_file = None
+
+        if resolved_file != last_file and len(unique_files) > 1:
+            console.print(f"  [green]{resolved_file}[/green]")
+            last_file = resolved_file
+
+        ts = _format_timestamp(e["timestamp"])
+        tool = e.get("tool_name") or "?"
+
+        # Short preview of the change
+        old = (e.get("old_content") or "").strip().replace("\n", " ")[:60]
+        new = (e.get("new_content") or "").strip().replace("\n", " ")[:60]
+        preview = ""
+        if tool == "Edit" and old and new:
+            preview = f"[red]{old}[/red] → [green]{new}[/green]"
+        elif tool == "Write":
+            char_count = len(e.get("new_content") or "")
+            preview = f"[green]wrote {char_count} chars[/green]"
+        elif tool == "MultiEdit":
+            preview = "[green]multi-edit[/green]"
+
+        console.print(f"    [dim]{ts}[/dim] {tool}  {preview}")
+        console.print(f"      [dim]event:[/dim] {e['event_id']}")
+
+
+# -----------------------------------------------------------------------------
+# INSTALL / AUTO-INGEST / DOCTOR
+# -----------------------------------------------------------------------------
+
+hook_app = typer.Typer(
+    name="hook",
+    help="Claude Code SessionEnd + Stop hooks (auto-ingest, live + final)",
+)
+mcp_app = typer.Typer(name="mcp", help="Claude Desktop MCP server integration")
+schedule_app = typer.Typer(
+    name="schedule",
+    help="Background reconciler (launchd) — catches sessions when hooks miss",
+)
+
+app.add_typer(db_app, name="db", rich_help_panel="Data")
+app.add_typer(backup_app, name="backup", rich_help_panel="Data")
+app.command("restore", rich_help_panel="Data")(restore)
+app.add_typer(hook_app, name="hook", rich_help_panel="Plumbing")
+app.add_typer(mcp_app, name="mcp", rich_help_panel="Plumbing")
+app.add_typer(schedule_app, name="schedule", rich_help_panel="Plumbing")
+
+
+@hook_app.command("install")
+def hook_install_cmd():
+    """Install the SessionEnd + Stop hooks into ~/.claude/settings.json."""
+    _hook_install()
+
+
+@hook_app.command("uninstall")
+def hook_uninstall_cmd():
+    """Remove the SessionEnd + Stop hooks."""
+    _hook_uninstall()
+
+
+@schedule_app.command("install-reconciler")
+def schedule_install_reconciler_cmd():
+    """Install a launchd job that runs `longhand reconcile --fix` every 30 minutes."""
+    from longhand.setup_commands import schedule_install_reconciler
+
+    schedule_install_reconciler()
+
+
+@schedule_app.command("uninstall-reconciler")
+def schedule_uninstall_reconciler_cmd():
+    """Remove the launchd reconciler job."""
+    from longhand.setup_commands import schedule_uninstall_reconciler
+
+    schedule_uninstall_reconciler()
+
+
+# Prompt hook subcommands — auto-context injection on user message
+prompt_hook_app = typer.Typer(
+    name="prompt-hook",
+    help="Claude Code UserPromptSubmit hook (auto-context injection)",
+)
+app.add_typer(prompt_hook_app, name="prompt-hook", rich_help_panel="Plumbing")
+
+
+@prompt_hook_app.command("install")
+def prompt_hook_install_cmd():
+    """Install the UserPromptSubmit hook for auto-context injection."""
+    _prompt_hook_install()
+
+
+@prompt_hook_app.command("uninstall")
+def prompt_hook_uninstall_cmd():
+    """Remove the UserPromptSubmit hook."""
+    _prompt_hook_uninstall()
+
+
+@app.command("__prompt-hook-run", hidden=True)
+def prompt_hook_run_cmd():
+    """Internal: read stdin JSON, return additionalContext via hookSpecificOutput.
+
+    Called by the UserPromptSubmit hook wiring. Not for direct user invocation.
+    """
+    _run_prompt_hook()
+
+
+@mcp_app.command("install")
+def mcp_install_cmd():
+    """Install Longhand's MCP server into Claude Desktop."""
+    _mcp_install()
+
+
+@mcp_app.command("uninstall")
+def mcp_uninstall_cmd():
+    """Remove Longhand's MCP server from Claude Desktop."""
+    _mcp_uninstall()
+
+
+def _run_mcp_server() -> None:
+    import asyncio
+
+    from longhand.mcp_server import main as mcp_main
+
+    asyncio.run(mcp_main())
+
+
+@mcp_app.command("serve")
+def mcp_serve_cmd():
+    """Run the MCP server (stdio). Used by Claude Desktop."""
+    _run_mcp_server()
+
+
+# Short alias so `longhand mcp-server` also works (matches install command)
+@app.command("mcp-server", hidden=True)
+def mcp_server_cmd():
+    """Run the MCP server (stdio). Used by Claude Desktop."""
+    _run_mcp_server()
+
+
+@app.command("shared-mcp", rich_help_panel="Plumbing")
+def shared_mcp_cmd():
+    """Run the shared-archive MCP server (stdio): keyword search over the archive
+    both Claude and Codex write, with no vector model loaded.
+
+    Register it as `longhand-shared` in Claude Code and as `longhand` in Codex —
+    see docs/codex.md.
+    """
+    from longhand.lightweight_mcp import mcp
+
+    mcp.run()
+
+
+@app.command("ingest-session", hidden=True)
+def ingest_session_cmd(
+    transcript: str | None = typer.Option(
+        None, "--transcript", "-t", help="Path to a single session JSONL"
+    ),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Ingest a single session file.
+
+    Dual-mode: accepts `--transcript <path>` for direct CLI use, OR reads
+    `{"transcript_path": "..."}` JSON from stdin when invoked by Claude Code's
+    SessionEnd hook (modern Claude Code passes hook data via stdin, not env vars).
+    Stdin-invoked runs are hook mode: they never exit nonzero — failures become
+    hook-error log breadcrumbs (see `longhand doctor`) for reconcile to heal.
+    """
+    hook_mode = transcript is None
+    if not transcript:
+        import json as _json
+        import sys as _sys
+
+        try:
+            raw = _sys.stdin.read(262144)  # bounded, ≤256KB
+            if raw.strip():
+                data = _json.loads(raw)
+                if isinstance(data, dict):
+                    transcript = data.get("transcript_path") or data.get("transcript") or None
+        except Exception:
+            pass
+
+        if not transcript:
+            # Hook invoked with no transcript info — exit silently so we never
+            # crash the Claude Code hook chain.
+            return
+
+    _ingest_single(transcript, data_dir, hook_mode=hook_mode)
+
+
+@app.command("ingest-live", hidden=True)
+def ingest_live_cmd(
+    transcript: str | None = typer.Option(
+        None, "--transcript", "-t", help="Path to a single session JSONL"
+    ),
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Tail-read new bytes of a transcript and upsert their events.
+
+    Called by the Stop hook (fires once per assistant turn). Idempotent and
+    fast — skips heavy analysis (episodes, segments, embeddings). The full
+    pass still runs at SessionEnd; this just keeps the events table fresh
+    during the session so a crash doesn't lose work.
+
+    Dual-mode: accepts ``--transcript <path>`` for direct CLI use, OR reads
+    ``{"transcript_path": "..."}`` JSON from stdin when invoked by Claude
+    Code's Stop hook.
+    """
+    from longhand.setup_commands import ingest_live_tail as _ingest_live_tail
+
+    if not transcript:
+        import json as _json
+        import sys as _sys
+
+        try:
+            raw = _sys.stdin.read(262144)  # bounded, ≤256KB
+            if raw.strip():
+                data = _json.loads(raw)
+                if isinstance(data, dict):
+                    transcript = data.get("transcript_path") or data.get("transcript") or None
+        except Exception:
+            pass
+
+        if not transcript:
+            return
+
+    _ingest_live_tail(transcript, data_dir)
+
+
+@app.command(rich_help_panel="Setup & health")
+def doctor(
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output"),
+):
+    """Diagnose Longhand installation and data."""
+    _doctor(json_out=json_out)
+
+
+@app.command("backfill-episodes", hidden=True)
+def backfill_episodes(
+    data_dir: str | None = typer.Option(None, "--data-dir"),
+):
+    """Embed every existing problem→fix episode into the vector store.
+
+    Needed once after upgrading to a version that added the episodes
+    ChromaDB collection. Idempotent — safe to re-run. The recall pipeline
+    spawns this in the background on first use, so most users never need
+    to call it directly.
+
+    Takes the ingest lock: the embedding pass writes ChromaDB, and a
+    concurrent ingest would race it. A locked-out run defers (success
+    exit) — the recall pipeline re-spawns it on the next query for as
+    long as the backfill is still needed.
+    """
+    from longhand.recall.project_fallback import (
+        claim_ingest_lock,
+        release_ingest_lock,
+    )
+
+    store = _get_store(data_dir)
+
+    sql_count = store.sqlite.count_episodes()
+    vector_count = store.vectors.episode_count()
+
+    if sql_count == 0:
+        console.print("[yellow]No episodes to embed (store is empty).[/yellow]")
+        return
+
+    if vector_count >= sql_count:
+        console.print(f"[green]✓[/green] All {sql_count} episodes already embedded.")
+        return
+
+    if not claim_ingest_lock(store):
+        console.print(
+            "[yellow]Another Longhand ingest is running — deferring the episode "
+            "backfill; the next recall will retry it.[/yellow]"
+        )
+        return
+
+    try:
+        console.print(
+            f"[cyan]Embedding {sql_count} episode(s)...[/cyan] [dim]({vector_count} already done)[/dim]"
+        )
+
+        def _progress(done: int, total: int) -> None:
+            console.print(f"   {done}/{total}...", end="\r")
+
+        embedded = store.backfill_episode_embeddings(progress=_progress)
+        console.print(
+            f"[green]✓[/green] Embedded {embedded} episode(s). "
+            f"Vector collection now has {store.vectors.episode_count()} entries."
+        )
+    finally:
+        release_ingest_lock(store)
+
+
+if __name__ == "__main__":
+    app()

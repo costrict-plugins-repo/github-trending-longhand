@@ -1,0 +1,1693 @@
+"""
+Longhand MCP server — lets Claude query Longhand memory during live sessions.
+
+Implements the Model Context Protocol so Claude Desktop and Claude Code
+can search, retrieve, and replay session data as tool calls.
+
+Run with:
+    python -m longhand.mcp_server
+
+The `mcp` dependency ships with Longhand; no extra install needed.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from typing import Any
+
+try:
+    from mcp.server import Server
+    from mcp.server.stdio import stdio_server
+    from mcp.types import TextContent, Tool, ToolAnnotations
+except ImportError:
+    print(
+        "The `mcp` package is required for the MCP server. "
+        "It ships with Longhand — reinstall with:\n"
+        "    pip install --upgrade longhand",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+from longhand.cli.helpers import _resolve_prefix
+from longhand.recall import recall as recall_pipeline
+from longhand.recall.project_match import match_projects
+from longhand.recall.recall_pipeline import recall_project_status, staleness_banner
+from longhand.recall.reconcile import run_reconcile
+from longhand.replay import ReplayEngine
+from longhand.storage import LonghandStore
+from longhand.storage.sqlite_store import _escape_like
+
+server: Server = Server("longhand")
+
+
+def _format_event(row: dict[str, Any], content_chars: int = 1500) -> dict[str, Any]:
+    """Turn a raw SQLite event row into a compact dict for Claude."""
+    return {
+        "event_id": row["event_id"],
+        "session_id": row["session_id"],
+        "event_type": row["event_type"],
+        "timestamp": row["timestamp"],
+        "tool_name": row.get("tool_name"),
+        "file_path": row.get("file_path"),
+        "content": (row.get("content") or "")[:content_chars],
+    }
+
+
+def _truncate_output(text: str, max_chars: int, hint: str | None = None) -> str:
+    """Cap output size and append a tool-specific pagination hint if truncated.
+
+    `hint` names the parameters the emitting tool actually accepts — callers
+    pass their own string so the suggestion matches the tool's surface.
+    """
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    hint_text = hint or "narrow your query"
+    return text[:max_chars] + (f"\n\n[... truncated at {max_chars} chars. {hint_text}]")
+
+
+# Tool-specific pagination hints — each names the params that actually exist
+# on the tool's surface so the user/agent can follow the hint literally.
+_HINT_SEARCH = "Use a smaller `limit` or add filters (session_id, tool_name, file_path_contains)."
+_HINT_SEARCH_IN_CONTEXT = "Use a smaller `limit`, fewer `context_events`, or a narrower query."
+_HINT_LIST_SESSIONS = "Use a smaller `limit` or a `project` filter."
+_HINT_TIMELINE = "Use `offset`/`limit`, `tail` for the last N events, or `summary_only: true`."
+_HINT_LATEST = "Use a smaller `limit` or filter by `event_type`."
+_HINT_RECALL = "Use a smaller `max_episodes` or a more specific query."
+_HINT_GIT = "Use a smaller `limit` or filter by `operation_type`."
+_HINT_PROJECTS = "Use a smaller `limit`, a `keyword`, or a `category` filter."
+
+
+MAX_LIMIT = 1000
+
+# Fuzzy-match score at or above which a tool trusts match_projects enough to
+# act on the top hit without an explicit project filter (search auto-scoping,
+# list_sessions staleness banners). Trade-off: higher and literal project
+# names get buried under cross-project noise; lower and vague queries get
+# wrongly pinned to one project. 0.8 = a strong name/alias/keyword hit,
+# below exact-path certainty. Every auto-scope decision is surfaced via
+# `auto_scoped_to` in the payload — the evidence channel for tuning this.
+AUTO_SCOPE_MIN_SCORE = 0.8
+MAX_OUTPUT_CHARS = 200000
+MAX_QUERY_CHARS = 2000
+
+
+# All tools except `reconcile` are pure read-over-local-storage:
+#   readOnlyHint=True so MCP clients can auto-approve them
+#   openWorldHint=False — no network, no external services, just SQLite + Chroma + JSONL
+_READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+
+# `reconcile` mutates the SQLite store (re-ingests missing transcripts) but is
+# idempotent — re-running with the same on-disk state is a no-op.
+_RECONCILE_HINTS = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+
+
+# Reusable output schemas — most Longhand tools return either a flat list of
+# event-shaped rows or a list of session-shaped rows. Defining once and
+# reusing keeps the Tool() blocks readable.
+_EVENT_ROW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "event_id": {"type": "string"},
+        "session_id": {"type": "string"},
+        "event_type": {"type": "string"},
+        "timestamp": {"type": "string"},
+        "tool_name": {"type": ["string", "null"]},
+        "file_path": {"type": ["string", "null"]},
+        "content": {"type": "string"},
+    },
+}
+_GIT_OP_ROW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "session_id": {"type": "string"},
+        "timestamp": {"type": "string"},
+        "operation_type": {"type": "string"},
+        "branch": {"type": ["string", "null"]},
+        "hash": {"type": ["string", "null"]},
+        "message": {"type": ["string", "null"]},
+    },
+}
+_SESSION_ROW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "session_id": {"type": "string"},
+        "started_at": {"type": ["string", "null"]},
+        "ended_at": {"type": ["string", "null"]},
+        "event_count": {"type": ["integer", "null"]},
+        "project_id": {"type": ["string", "null"]},
+        "project_path": {"type": ["string", "null"]},
+        "outcome": {"type": ["string", "null"]},
+        "outcome_summary": {"type": ["string", "null"]},
+    },
+}
+
+
+def _int(value: Any, default: int) -> int:
+    """Coerce a value to int, handling string inputs from MCP bridge."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def _limit(value: Any, default: int) -> int:
+    """Coerce to int and clamp to [1, MAX_LIMIT].
+
+    The floor matters: a negative value would otherwise pass straight
+    through min() and become SQLite's LIMIT -1, i.e. unbounded.
+    """
+    return max(1, min(_int(value, default), MAX_LIMIT))
+
+
+def _tail(value: Any) -> int:
+    """Coerce the optional `tail` count, where 0 means "not requested".
+
+    Deliberately NOT _limit(): that floors at 1, so an absent `tail` would
+    clamp to 1 and be indistinguishable from a request for the last single
+    event — which silently swallows `offset`/`limit`. That regression shipped
+    from 2026-06-09 (bad2f17) through v1.2.0.
+    """
+    return max(0, min(_int(value, 0), MAX_LIMIT))
+
+
+def _offset(value: Any) -> int:
+    """Coerce to int and floor at 0 so negative offsets can't reach SQL."""
+    return max(0, _int(value, 0))
+
+
+def _query(value: Any) -> str:
+    """Coerce the semantic query to a bounded string.
+
+    Caps length before the text reaches the ChromaDB ONNX encoder so a
+    multi-megabyte query can't pin the CPU embedding it.
+    """
+    text = value if isinstance(value, str) else str(value or "")
+    return text[:MAX_QUERY_CHARS]
+
+
+def _max_chars(value: Any, default: int) -> int:
+    """Coerce to int and cap at MAX_OUTPUT_CHARS."""
+    return min(_int(value, default), MAX_OUTPUT_CHARS)
+
+
+def _bool(value: Any, default: bool) -> bool:
+    """Coerce a value to bool, handling string inputs from MCP bridge."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ("true", "1", "yes")
+    return bool(value)
+
+
+def _format_project_compact(row: dict[str, Any]) -> dict[str, Any]:
+    """Return a compact project summary (no JSON blobs)."""
+    return {
+        "project_id": row["project_id"],
+        "display_name": row.get("display_name"),
+        "canonical_path": row.get("canonical_path"),
+        "category": row.get("category"),
+        "session_count": row.get("session_count"),
+        "total_edits": row.get("total_edits"),
+        "last_seen": row.get("last_seen"),
+    }
+
+
+def _tool(**kwargs: Any) -> Tool:
+    """Build a Tool, intentionally dropping any ``outputSchema``.
+
+    The handlers below return ``TextContent`` only (JSON dumped as text), never
+    MCP ``structuredContent`` — so the per-tool ``outputSchema`` blocks are kept
+    purely as inline documentation of each tool's JSON shape and are NOT sent to
+    the client. Claude Code's MCP validator rejects any tool whose
+    ``outputSchema.type`` is not ``"object"``, which silently broke loading of
+    12 of 19 tools (issue #9). Stripping the field makes every tool load, is
+    spec-compliant (outputSchema is optional), and is honest: we don't emit
+    structured output, so we don't advertise a schema for it.
+    """
+    kwargs.pop("outputSchema", None)
+    return Tool(**kwargs)
+
+
+@server.list_tools()
+async def list_tools() -> list[Tool]:
+    return [
+        _tool(
+            name="search",
+            title="Search Session Events (Semantic)",
+            description=(
+                "Semantic search across all stored Claude Code session events. "
+                "Returns events matching a natural language query, with optional "
+                "filters by event type, session, project, tool, or file path. "
+                "IMPORTANT: Always pass session_id when you know which session to search — "
+                "unscoped search returns noisy results. To read matches WITH their "
+                "surrounding conversation, pass context_events (requires session_id): "
+                "each match comes back with N events before and after it."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Natural language query"},
+                    "limit": {
+                        "type": "integer",
+                        "default": 10,
+                        "description": "Max results (default 10, capped at 1000)",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Scope search to a single session (prefix match — first 8 chars usually enough)",
+                    },
+                    "context_events": {
+                        "type": "integer",
+                        "description": "With session_id: return each match wrapped in N surrounding events (the old search_in_context)",
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": "Scope search to a project by project_id",
+                    },
+                    "project_name": {
+                        "type": "string",
+                        "description": "Scope search to a project by name substring (e.g. 'gonzo')",
+                    },
+                    "event_type": {
+                        "type": "string",
+                        "description": "Filter: user_message, assistant_text, assistant_thinking, tool_call, tool_result",
+                    },
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Filter by tool name (Edit, Bash, Read, etc.)",
+                    },
+                    "file_path_contains": {
+                        "type": "string",
+                        "description": "Filter to events with an explicit file_path containing this string (tool_call/tool_result events only — user messages won't have file_path metadata)",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "default": 12000,
+                        "description": "Max total output characters (default 12000). Set higher if you need full content.",
+                    },
+                },
+                "required": ["query"],
+            },
+            outputSchema={
+                "type": "array",
+                "description": "Array of matching events ordered by semantic relevance.",
+                "items": _EVENT_ROW_SCHEMA,
+            },
+            annotations=_READ_ONLY,
+        ),
+        _tool(
+            name="list_sessions",
+            title="List Indexed Sessions",
+            description=(
+                "List recent Claude Code sessions that Longhand has indexed. "
+                "Returns session ID, project path, start/end timestamps, event count, "
+                "and outcome (shipped/fixed/stuck/exploratory) for each session. "
+                "Use this to orient before drilling into a specific session — e.g., "
+                "'which sessions touched this project last week?' Filter by project "
+                "path substring to narrow results. NOT for searching content — use "
+                "`search` or `recall` for that. NOT for cross-session git history — "
+                "use `find_commits`. Pass project_id (with optional since/until) for a "
+                "project's session timeline enriched with outcomes — the old "
+                "get_project_timeline. When a `project` filter matches a known project "
+                "and its on-disk transcripts exceed what's indexed, the response wraps "
+                "a `{stale, stale_reason, sessions}` envelope — call the `reconcile` "
+                "tool with fix=true to catch up."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Filter by project path substring (e.g. 'longhand', 'bsoi')",
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": "Exact project_id — returns that project's session timeline enriched with outcomes",
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": "ISO date — only sessions after this (with project_id)",
+                    },
+                    "until": {
+                        "type": "string",
+                        "description": "ISO date — only sessions before this (with project_id)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 50,
+                        "description": "Max results (default 50, capped at 1000)",
+                    },
+                },
+            },
+            outputSchema={
+                "oneOf": [
+                    {
+                        "type": "array",
+                        "description": "Plain list of session rows when no staleness was detected.",
+                        "items": _SESSION_ROW_SCHEMA,
+                    },
+                    {
+                        "type": "object",
+                        "description": "Staleness envelope when on-disk transcripts exceed indexed count.",
+                        "properties": {
+                            "stale": {"type": "boolean"},
+                            "stale_reason": {"type": "string"},
+                            "sessions": {"type": "array", "items": _SESSION_ROW_SCHEMA},
+                        },
+                    },
+                ],
+            },
+            annotations=_READ_ONLY,
+        ),
+        _tool(
+            name="get_session_timeline",
+            title="Session Event Timeline",
+            description=(
+                "Get a chronological timeline of events in a session. Supports session "
+                "id prefix match. Use 'tail' to get only the last N events — how a "
+                "session ended, the latest user message, the most recent tool call "
+                "(this replaces get_latest_events). Use 'offset' to paginate through long sessions. "
+                "NOT for searching — if you're looking for something specific in a session, "
+                "use search with session_id and context_events instead of paginating this "
+                "tool in a loop."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "limit": {
+                        "type": "integer",
+                        "default": 100,
+                        "description": "Max events to return (default 100, capped at 1000)",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "Skip first N events (for pagination)",
+                    },
+                    "tail": {
+                        "type": "integer",
+                        "description": "Return only the last N events of the session",
+                    },
+                    "include_thinking": {"type": "boolean", "default": True},
+                    "event_type": {
+                        "type": "string",
+                        "description": "Filter to a single event type",
+                    },
+                    "summary_only": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Return only event_type, timestamp, tool_name, file_path — no content. Great for scanning long sessions.",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "default": 16000,
+                        "description": "Max total output characters",
+                    },
+                },
+                "required": ["session_id"],
+            },
+            outputSchema={
+                "type": "object",
+                "description": "Wrapped result with pagination metadata + the events array.",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "returned": {"type": "integer"},
+                    "offset": {"type": ["integer", "null"]},
+                    "tail": {"type": ["integer", "null"]},
+                    "events": {"type": "array", "items": _EVENT_ROW_SCHEMA},
+                },
+            },
+            annotations=_READ_ONLY,
+        ),
+        _tool(
+            name="replay_file",
+            title="Reconstruct File State at a Point in Time",
+            description=(
+                "Reconstruct the exact state of a file at any point in a past session. "
+                "Applies every Write/Edit event verbatim from the session JSONL in order — "
+                "no summarization, no approximation. Returns the full file content as it "
+                "existed at that moment. Use when you need to see 'what did this file "
+                "look like after that refactor?' or 'what was the state before it broke?' "
+                "Pass at_event_id to stop replay at a specific event; omit it to get the "
+                "final state at session end. NOT for browsing every change to a file — "
+                "use `get_file_history` for an edit-by-edit log instead. NOT for finding "
+                "which session edited a file — use `get_file_history` (no session_id) for "
+                "that. Requires session_id and file_path."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID (prefix match — first 8 chars usually enough)",
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Exact file path to reconstruct (must match the path the session used)",
+                    },
+                    "at_event_id": {
+                        "type": "string",
+                        "description": "Optional: stop replay at this event ID to get mid-session state. Omit for final state at session end.",
+                    },
+                },
+                "required": ["session_id", "file_path"],
+            },
+            outputSchema={
+                "type": "object",
+                "description": "Reconstructed file state and the metadata about how it was built.",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "session_id": {"type": "string"},
+                    "at_event_id": {"type": ["string", "null"]},
+                    "at_timestamp": {"type": "string"},
+                    "source": {
+                        "type": "string",
+                        "description": "Origin of the base content (write, initial_read, etc.)",
+                    },
+                    "edits_applied": {"type": "integer"},
+                    "content": {
+                        "type": "string",
+                        "description": "Full reconstructed file content at the requested point in time.",
+                    },
+                },
+            },
+            annotations=_READ_ONLY,
+        ),
+        _tool(
+            name="get_file_history",
+            title="Edit Log for a File Across Sessions",
+            description=(
+                "Get every edit ever made to a file across all sessions, in chronological "
+                "order. Returns session ID, timestamp, event type (Write/Edit), old and new "
+                "content for each change. Use this to answer 'how has this file evolved?' or "
+                "'which session edited this file last?' across your entire history. "
+                "Optionally scope to a single session. NOT for reconstructing a file's "
+                "state at a moment in time — use `replay_file` for that. NOT for content "
+                "search inside the file body — use `search` with `file_path_contains` "
+                "instead."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Exact file path to look up"},
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional: limit to a single session (prefix match)",
+                    },
+                },
+                "required": ["file_path"],
+            },
+            outputSchema={
+                "type": "array",
+                "description": "Chronological list of edit events for the file.",
+                "items": _EVENT_ROW_SCHEMA,
+            },
+            annotations=_READ_ONLY,
+        ),
+        _tool(
+            name="get_stats",
+            title="Storage Statistics",
+            description=(
+                "Returns a flat key-value snapshot of Longhand's local SQLite + Chroma "
+                "store: total sessions, events, tool_calls, file_edits, thinking_blocks, "
+                "vectors_indexed, projects, episodes (resolved + unresolved), and the "
+                "data_dir path. Use as a health check after a fresh upgrade, to verify "
+                "ingest is keeping up with on-disk transcripts, or to answer 'how much "
+                "have I indexed?' "
+                "NOT for searching session content — `search` and `recall` are the tools "
+                "for that. NOT for per-project counts — call `list_projects` for that. "
+                "Takes no parameters; output is a single flat object."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+            outputSchema={
+                "type": "object",
+                "description": "Flat key-value snapshot of Longhand's local store.",
+                "properties": {
+                    "total_sessions": {"type": "integer"},
+                    "total_events": {"type": "integer"},
+                    "total_tool_calls": {"type": "integer"},
+                    "total_file_edits": {"type": "integer"},
+                    "total_thinking_blocks": {"type": "integer"},
+                    "total_vectors": {"type": "integer"},
+                    "total_projects": {"type": "integer"},
+                    "total_episodes": {"type": "integer"},
+                    "resolved_episodes": {"type": "integer"},
+                    "unresolved_episodes": {"type": "integer"},
+                    "data_dir": {"type": "string"},
+                },
+            },
+            annotations=_READ_ONLY,
+        ),
+        _tool(
+            name="recall",
+            title="Proactive Recall (Episodes + Narrative)",
+            description=(
+                "PROACTIVE MEMORY — START HERE for any 'do you remember...' question. "
+                "Handles fuzzy time references ('a couple months ago'), project matching "
+                "('that game project'), and retrieval in ONE call. Returns a prebuilt "
+                "markdown narrative from conversation segments and session timelines, "
+                "plus matched projects and — when the work left clean problem→fix "
+                "evidence — high-precision episodes with diffs, verbatim thinking "
+                "blocks, and reconstructed file states. "
+                "Do NOT manually search and paginate — use this tool first."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Natural language question"},
+                    "max_episodes": {
+                        "type": "integer",
+                        "default": 5,
+                        "description": "Max episodes to return",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "default": 16000,
+                        "description": "Max total output characters",
+                    },
+                },
+                "required": ["query"],
+            },
+            annotations=_READ_ONLY,
+        ),
+        _tool(
+            name="recall_project_status",
+            title="Pick Up Where You Left Off (Project Status)",
+            description=(
+                "Get the current status of a project — where you left off, recent "
+                "commits, unresolved issues, and latest conversation context. Takes "
+                "a project name (fuzzy match) and returns a structured summary with "
+                "git history, linked episodes, and conversation segments. "
+                "Use this when someone says 'pick up where we left off on X', "
+                "'what's the status of X', or 'where did we end on X'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project name, alias, or ID (fuzzy match)",
+                    },
+                    "max_commits": {
+                        "type": "integer",
+                        "default": 10,
+                        "description": "Max recent commits to show",
+                    },
+                    "max_episodes": {
+                        "type": "integer",
+                        "default": 5,
+                        "description": "Max recent episodes",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "default": 16000,
+                        "description": "Max output characters",
+                    },
+                },
+                "required": ["project"],
+            },
+            annotations=_READ_ONLY,
+        ),
+        _tool(
+            name="reconcile",
+            title="Re-ingest Missing Transcripts (Disk ↔ DB)",
+            description=(
+                "Bridge disk↔DB drift from inside an MCP session. Re-ingests any "
+                "on-disk Claude Code transcripts that are missing from the sessions "
+                "table or have NULL project_id, using current project-inference "
+                "logic. Call this when another tool surfaces `stale: true` with a "
+                "`stale_reason` pointing at reconcile, or when `recall_project_status` "
+                "reports `session_count_on_disk > session_count_indexed`. "
+                "Returns counts of fully-indexed, null-project, missing, ingested, "
+                "and errors. Idempotent — re-running with the same on-disk state is a "
+                "no-op. Acquires the ingest lock — serialized with concurrent ingestion. "
+                "May take 30s+ on cold state because it runs embeddings and episode "
+                "extraction during re-ingest. Defaults to a DRY RUN: pass `fix=true` "
+                "to actually re-ingest."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "fix": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Apply the repairs: re-ingest missing/null-project transcripts. Defaults to false, which returns a dry-run summary.",
+                    },
+                },
+            },
+            outputSchema={
+                "type": "object",
+                "description": (
+                    "Counts of fully-indexed, partially-indexed, null-project, "
+                    "missing, ingested, and errors."
+                ),
+                "properties": {
+                    "fully_indexed": {"type": "integer"},
+                    "partially_indexed": {"type": "integer"},
+                    "skipped_oversize": {"type": "integer"},
+                    "null_project": {"type": "integer"},
+                    "missing": {"type": "integer"},
+                    "ingested": {"type": "integer"},
+                    "errors": {"type": "integer"},
+                },
+            },
+            annotations=_RECONCILE_HINTS,
+        ),
+        _tool(
+            name="find_episodes",
+            title="Find Problem→Fix Episodes",
+            description=(
+                "Structured search for problem→fix episodes. Filters: project_ids, time "
+                "range, keyword, has_fix. Returns raw episode rows. Pass episode_id "
+                "instead for FULL detail on one episode — referenced events, diff, and "
+                "post-fix file state (the old get_episode). NOT for narrative recall — "
+                "use `recall` for that."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "episode_id": {
+                        "type": "string",
+                        "description": "Detail mode: return full detail for exactly this episode (all other filters ignored)",
+                    },
+                    "project_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional: filter to one or more project_ids",
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": "ISO timestamp — only episodes after this date",
+                    },
+                    "until": {
+                        "type": "string",
+                        "description": "ISO timestamp — only episodes before this date",
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "Substring match against episode summary text",
+                    },
+                    "has_fix": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "If True, return only episodes that have a resolved fix",
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "default": 0.5,
+                        "description": (
+                            "Minimum extraction confidence (0-1). Low-confidence "
+                            "episodes are noise-prone probes; pass 0 to include all."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 20,
+                        "description": "Max results (default 20, capped at 1000)",
+                    },
+                },
+            },
+            outputSchema={
+                "type": "array",
+                "description": "Raw episode rows in reverse chronological order.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "episode_id": {"type": "string"},
+                        "project_id": {"type": ["string", "null"]},
+                        "session_id": {"type": ["string", "null"]},
+                        "started_at": {"type": ["string", "null"]},
+                        "resolved_at": {"type": ["string", "null"]},
+                        "summary": {"type": ["string", "null"]},
+                        "fix_summary": {"type": ["string", "null"]},
+                        "has_fix": {"type": "boolean"},
+                    },
+                },
+            },
+            annotations=_READ_ONLY,
+        ),
+        _tool(
+            name="find_commits",
+            title="Find Commits Across Sessions",
+            description=(
+                "Search git history captured from sessions. With a query: match commits "
+                "across all sessions by message, hash prefix, or branch name. Without a "
+                "query but with a session_id: every git operation in that session in "
+                "chronological order (the old get_session_commits)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional: commit message substring, hash prefix, or branch name. Omit (with session_id) to list a session's git operations chronologically.",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional: scope to a single session (prefix match)",
+                    },
+                    "operation_type": {
+                        "type": "string",
+                        "description": "Filter by operation type (default: all)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 20,
+                        "description": "Max results (default 20, capped at 1000)",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "default": 12000,
+                        "description": "Max output characters",
+                    },
+                },
+            },
+            outputSchema={
+                "type": "array",
+                "description": "Matching git operations across sessions.",
+                "items": _GIT_OP_ROW_SCHEMA,
+            },
+            annotations=_READ_ONLY,
+        ),
+        _tool(
+            name="list_projects",
+            title="List Inferred Projects",
+            description=(
+                "Browse all projects Longhand has inferred from your session history. "
+                "Returns project ID, display name, canonical path, category (cli tool / "
+                "web app / library / etc.), and session count. Filter by keyword (matches "
+                "name, path, aliases) or category. Pass match for fuzzy matching with "
+                "scored reasons — 'which project did you mean?' (the old match_project). "
+                "Use this to find a project_id before calling recall_project_status or "
+                "list_sessions(project_id=...). Set verbose=true for full metadata "
+                "(aliases, languages, keywords arrays)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "match": {
+                        "type": "string",
+                        "description": "Fuzzy-match mode: partial name/category/description → scored candidates with reasons",
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "Filter: matches project name, path, or aliases",
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Filter: e.g. 'cli tool', 'web app', 'library'",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 20,
+                        "description": "Max results (default 20, capped at 1000)",
+                    },
+                    "verbose": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Return full project rows including aliases, keywords, languages JSON",
+                    },
+                },
+            },
+            outputSchema={
+                "type": "array",
+                "description": "Inferred project summaries; verbose mode adds aliases/keywords/languages.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "display_name": {"type": ["string", "null"]},
+                        "canonical_path": {"type": ["string", "null"]},
+                        "category": {"type": ["string", "null"]},
+                        "session_count": {"type": ["integer", "null"]},
+                        "total_edits": {"type": ["integer", "null"]},
+                        "last_seen": {"type": ["string", "null"]},
+                    },
+                },
+            },
+            annotations=_READ_ONLY,
+        ),
+        _tool(
+            name="list_plans",
+            title="List Plan Writes",
+            description=(
+                "Every Write/Edit ever made to a `~/.claude/plans/*.md` file across "
+                "all ingested sessions. Returned newest-first with session_id and the "
+                "exact event_id of each write — pair with replay_file to reconstruct "
+                "an early version of a plan that was later overwritten. Use when the "
+                "user asks 'what was the original plan' or 'what did I plan for X.'"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "default": 50,
+                        "description": "Max plans to return (default 50, capped at 1000)",
+                    },
+                },
+            },
+            outputSchema={
+                "type": "array",
+                "description": "Plan write events ordered newest-first.",
+                "items": _EVENT_ROW_SCHEMA,
+            },
+            annotations=_READ_ONLY,
+        ),
+    ]
+
+
+# ─── Tool handlers ──────────────────────────────────────────────────────────
+#
+# Each tool is a module-level async function taking (store, arguments) and
+# returning a list[TextContent]. This makes them individually unit-testable
+# without going through the MCP dispatch layer.
+
+
+async def _tool_search(store: LonghandStore, arguments: dict[str, Any]) -> list[TextContent]:
+    # Context mode absorbs the old search_in_context: same params, 1:1.
+    if arguments.get("context_events") and arguments.get("session_id"):
+        return await _tool_search_in_context(store, arguments)
+
+    limit = _limit(arguments.get("limit"), 10)
+    max_chars = _max_chars(arguments.get("max_chars"), 12000)
+    query = _query(arguments.get("query"))
+
+    # Resolve session_id prefix if provided
+    search_session_id = None
+    if arguments.get("session_id"):
+        search_session_id = _resolve_prefix(store, arguments["session_id"])
+
+    # Resolve project_name → set of session_ids for post-filtering
+    project_session_ids: set[str] | None = None
+    project_id = arguments.get("project_id")
+    project_name = arguments.get("project_name")
+
+    # Auto-scope when the query names a project but no explicit project
+    # filter was set. Reuses match_projects — the same fuzzy infrastructure
+    # the recall tool uses — so literal project names don't get buried under
+    # semantically-similar events from sibling projects.
+    #
+    # An explicit session_id suppresses this entirely: it is the most specific
+    # filter there is, and layering a fuzzy project match on top of it
+    # intersects to nothing whenever the guessed project doesn't contain that
+    # session — returning zero hits with a hint that blames project scope.
+    auto_scoped_to: str | None = None
+    if not project_id and not project_name and not search_session_id:
+        try:
+            matches = match_projects(store, query, top_k=1)
+            if matches and matches[0].score >= AUTO_SCOPE_MIN_SCORE:
+                project_name = matches[0].display_name
+                auto_scoped_to = matches[0].display_name
+        except Exception:
+            pass
+
+    if project_id or project_name:
+        if project_name and not project_id:
+            projects = store.sqlite.list_projects(keyword=project_name, limit=5)
+            if projects:
+                project_id = projects[0]["project_id"]
+        if project_id:
+            proj_sessions = store.sqlite.list_sessions(project_id=project_id, limit=1000)
+            project_session_ids = {s["session_id"] for s in proj_sessions}
+
+            # Fallback: if no sessions linked via project_id, find sessions
+            # that edited files in the project's directory
+            if not project_session_ids:
+                proj = store.sqlite.get_project(project_id)
+                if proj and proj.get("canonical_path"):
+                    canon = proj["canonical_path"]
+                    with store.sqlite.connect() as conn:
+                        rows = conn.execute(
+                            "SELECT DISTINCT session_id FROM events "
+                            "WHERE file_path LIKE ? ESCAPE '\\'",
+                            (f"%{_escape_like(canon)}%",),
+                        ).fetchall()
+                        project_session_ids = {r["session_id"] for r in rows}
+
+    # When post-filters are active, request extra results so we have enough after filtering
+    has_post_filter = project_session_ids is not None or arguments.get("file_path_contains")
+    fetch_multiplier = 5 if has_post_filter else 1
+
+    hits = store.vectors.search(
+        query=query,
+        n_results=limit * fetch_multiplier,
+        event_type=arguments.get("event_type"),
+        session_id=search_session_id,
+        tool_name=arguments.get("tool_name"),
+        file_path_contains=arguments.get("file_path_contains"),
+    )
+
+    # Post-filter by project if needed
+    if project_session_ids is not None:
+        hits = [
+            h for h in hits if (h.get("metadata") or {}).get("session_id") in project_session_ids
+        ]
+
+    hits = hits[:limit]
+
+    # Staleness banner: when this search was scoped to a project (auto or
+    # explicit), check whether that project has on-disk transcripts not yet in
+    # the DB. If so, wrap the response with a stale/stale_reason banner so the
+    # caller sees the same signal `recall_project_status` surfaces — closes the
+    # silent-failure class where a stale index returned `hits: []` with no hint.
+    canonical_path: str | None = None
+    if project_id:
+        proj = store.sqlite.get_project(project_id)
+        if proj:
+            canonical_path = proj.get("canonical_path")
+    banner = staleness_banner(store, project_id, canonical_path)
+
+    payload: dict[str, Any] | list[dict[str, Any]]
+    if auto_scoped_to is not None or banner is not None:
+        envelope: dict[str, Any] = {}
+        if auto_scoped_to is not None:
+            envelope["auto_scoped_to"] = auto_scoped_to
+            envelope["auto_scope_hint"] = (
+                f"Query appeared to name a project; results are scoped to "
+                f"'{auto_scoped_to}'. Pass project_name=None to override."
+            )
+        if banner is not None:
+            envelope["stale"] = True
+            envelope["stale_reason"] = banner["stale_reason"]
+        envelope["hits"] = hits
+        payload = envelope
+    else:
+        payload = hits
+    output = json.dumps(payload, indent=2, default=str)
+    return [TextContent(type="text", text=_truncate_output(output, max_chars, _HINT_SEARCH))]
+
+
+async def _tool_search_in_context(
+    store: LonghandStore, arguments: dict[str, Any]
+) -> list[TextContent]:
+    full_id = _resolve_prefix(store, arguments["session_id"])
+    if not full_id:
+        return [
+            TextContent(type="text", text=f"No session matching prefix: {arguments['session_id']}")
+        ]
+
+    context_n = _int(arguments.get("context_events"), 5)
+    limit = _limit(arguments.get("limit"), 3)
+    max_chars = _max_chars(arguments.get("max_chars"), 20000)
+    query = _query(arguments.get("query"))
+
+    # Semantic search scoped to this session
+    hits = store.vectors.search(
+        query=query,
+        n_results=limit * 3,  # fetch extra for dedup
+        session_id=full_id,
+        event_type=arguments.get("event_type"),
+    )
+
+    if not hits:
+        return [TextContent(type="text", text="No matches found in this session.")]
+
+    # Build context windows from sequence numbers
+    windows: list[dict[str, Any]] = []
+    for hit in hits:
+        seq = (hit.get("metadata") or {}).get("sequence")
+        if seq is None:
+            continue
+        seq = int(seq)
+        windows.append(
+            {
+                "match_event_id": hit["event_id"],
+                "match_distance": hit.get("distance", 1.0),
+                "seq_start": max(0, seq - context_n),
+                "seq_end": seq + context_n,
+            }
+        )
+
+    if not windows:
+        return [TextContent(type="text", text="Matches found but no sequence metadata available.")]
+
+    # Merge strictly overlapping windows. We used to merge on adjacency
+    # (`<= seq_end + 1`) which collapsed unrelated matches separated by a
+    # single sequence step — the resulting blob spanned conversations that
+    # had nothing to do with each other. Strict overlap keeps each match's
+    # context coherent.
+    windows.sort(key=lambda w: w["seq_start"])
+    merged: list[dict[str, Any]] = []
+    for w in windows:
+        if merged and w["seq_start"] <= merged[-1]["seq_end"]:
+            merged[-1]["seq_end"] = max(merged[-1]["seq_end"], w["seq_end"])
+            merged[-1]["match_event_ids"].append(w["match_event_id"])
+        else:
+            merged.append(
+                {
+                    "seq_start": w["seq_start"],
+                    "seq_end": w["seq_end"],
+                    "match_event_ids": [w["match_event_id"]],
+                }
+            )
+
+    # Deduplicate: keep only the first `limit` unique matches
+    all_match_ids: list[str] = []
+    for mw in merged:
+        for mid in mw["match_event_ids"]:
+            if mid not in all_match_ids:
+                all_match_ids.append(mid)
+    all_match_ids = all_match_ids[:limit]
+    match_id_set = set(all_match_ids)
+
+    # Re-filter merged windows to only those containing kept matches
+    final_windows: list[dict[str, Any]] = []
+    for mw in merged:
+        kept = [m for m in mw["match_event_ids"] if m in match_id_set]
+        if kept:
+            mw["match_event_ids"] = kept
+            final_windows.append(mw)
+
+    # Fetch events for each window
+    results = []
+    for mw in final_windows:
+        events = store.sqlite.get_events_by_sequence_range(full_id, mw["seq_start"], mw["seq_end"])
+        formatted = []
+        for e in events:
+            fe = _format_event(e)
+            fe["is_match"] = e["event_id"] in match_id_set
+            formatted.append(fe)
+        results.append(
+            {
+                "sequence_range": [mw["seq_start"], mw["seq_end"]],
+                "events": formatted,
+            }
+        )
+
+    payload = {
+        "session_id": full_id,
+        "query": query,
+        "total_matches": len(hits),
+        "showing": len(all_match_ids),
+        "context_windows": results,
+    }
+    output = json.dumps(payload, indent=2, default=str)
+    return [
+        TextContent(type="text", text=_truncate_output(output, max_chars, _HINT_SEARCH_IN_CONTEXT))
+    ]
+
+
+async def _tool_list_sessions(store: LonghandStore, arguments: dict[str, Any]) -> list[TextContent]:
+    # project_id mode absorbs the old get_project_timeline: same params, 1:1,
+    # outcome enrichment included.
+    if arguments.get("project_id"):
+        return await _tool_get_project_timeline(store, arguments)
+
+    project_filter = arguments.get("project")
+    rows = store.sqlite.list_sessions(
+        project_path=project_filter,
+        limit=_limit(arguments.get("limit"), 50),
+    )
+
+    # Staleness banner: when filtered by project, resolve to a project_id and
+    # surface drift. Global list_sessions (no filter) has no project to check.
+    banner = None
+    if project_filter:
+        try:
+            matches = match_projects(store, project_filter, top_k=1)
+            if matches and matches[0].score >= AUTO_SCOPE_MIN_SCORE:
+                proj = store.sqlite.get_project(matches[0].project_id)
+                if proj:
+                    banner = staleness_banner(
+                        store,
+                        matches[0].project_id,
+                        proj.get("canonical_path"),
+                    )
+        except Exception:
+            banner = None
+
+    payload: dict[str, Any] | list[dict[str, Any]]
+    if banner is not None:
+        payload = {
+            "stale": True,
+            "stale_reason": banner["stale_reason"],
+            "sessions": rows,
+        }
+    else:
+        payload = rows
+    output = json.dumps(payload, indent=2, default=str)
+    return [TextContent(type="text", text=_truncate_output(output, 16000, _HINT_LIST_SESSIONS))]
+
+
+async def _tool_get_session_timeline(
+    store: LonghandStore, arguments: dict[str, Any]
+) -> list[TextContent]:
+    full_id = _resolve_prefix(store, arguments["session_id"])
+    if not full_id:
+        return [TextContent(type="text", text=f"No session matching: {arguments['session_id']}")]
+
+    tail = _tail(arguments.get("tail"))
+    offset = _offset(arguments.get("offset"))
+    limit = _limit(arguments.get("limit"), 100)
+    max_chars = _max_chars(arguments.get("max_chars"), 16000)
+    include_thinking = _bool(arguments.get("include_thinking"), True)
+    summary_only = _bool(arguments.get("summary_only"), False)
+
+    if tail:
+        # The end of the same ascending timeline the paginated branch returns:
+        # fetch newest-first under the cap, then restore ascending order.
+        # Fetching ascending and slicing the end returned the middle of any
+        # session longer than the cap.
+        all_events = store.sqlite.get_events(
+            session_id=full_id,
+            event_type=arguments.get("event_type"),
+            limit=5000,
+            newest_first=True,
+        )
+        all_events.reverse()
+        if not include_thinking:
+            all_events = [e for e in all_events if e["event_type"] != "assistant_thinking"]
+        # Filter out epoch-timestamp unknown events by default
+        all_events = [e for e in all_events if not e["event_type"].startswith("unk")]
+        events = all_events[-tail:]
+    else:
+        events = store.sqlite.get_events(
+            session_id=full_id,
+            event_type=arguments.get("event_type"),
+            limit=limit,
+            offset=offset,
+        )
+        if not include_thinking:
+            events = [e for e in events if e["event_type"] != "assistant_thinking"]
+        # Filter out epoch-timestamp unknown events by default
+        events = [e for e in events if not e["event_type"].startswith("unk")]
+
+    if summary_only:
+        formatted = [
+            {
+                "event_id": e["event_id"],
+                "event_type": e["event_type"],
+                "timestamp": e["timestamp"],
+                "tool_name": e.get("tool_name"),
+                "file_path": e.get("file_path"),
+            }
+            for e in events
+        ]
+    else:
+        formatted = [_format_event(e) for e in events]
+
+    # Add pagination metadata
+    meta: dict[str, Any] = {
+        "session_id": full_id,
+        "returned": len(formatted),
+        "offset": offset,
+    }
+    if tail:
+        meta["tail"] = tail
+    payload = {"meta": meta, "events": formatted}
+
+    output = json.dumps(payload, indent=2, default=str)
+    return [TextContent(type="text", text=_truncate_output(output, max_chars, _HINT_TIMELINE))]
+
+
+async def _tool_get_latest_events(
+    store: LonghandStore, arguments: dict[str, Any]
+) -> list[TextContent]:
+    full_id = _resolve_prefix(store, arguments["session_id"])
+    if not full_id:
+        return [TextContent(type="text", text=f"No session matching: {arguments['session_id']}")]
+
+    limit = _limit(arguments.get("limit"), 10)
+    max_chars = _max_chars(arguments.get("max_chars"), 16000)
+    event_type = arguments.get("event_type")
+
+    events = store.sqlite.get_latest_events(
+        session_id=full_id,
+        limit=limit,
+        event_type=event_type,
+    )
+
+    formatted = [_format_event(e) for e in events]
+    payload = {
+        "meta": {
+            "session_id": full_id,
+            "returned": len(formatted),
+            "limit": limit,
+            "event_type": event_type,
+            "order": "sequence DESC",
+        },
+        "events": formatted,
+    }
+    output = json.dumps(payload, indent=2, default=str)
+    return [TextContent(type="text", text=_truncate_output(output, max_chars, _HINT_LATEST))]
+
+
+async def _tool_replay_file(store: LonghandStore, arguments: dict[str, Any]) -> list[TextContent]:
+    full_id = _resolve_prefix(store, arguments["session_id"])
+    if not full_id:
+        return [TextContent(type="text", text=f"No session matching: {arguments['session_id']}")]
+
+    engine = ReplayEngine(store.sqlite)
+    state = engine.file_state_at(
+        file_path=arguments["file_path"],
+        session_id=full_id,
+        at_event_id=arguments.get("at_event_id"),
+    )
+    if not state:
+        return [TextContent(type="text", text=f"No edits found for {arguments['file_path']}")]
+
+    return [
+        TextContent(
+            type="text",
+            text=json.dumps(
+                {
+                    "file_path": state.file_path,
+                    "session_id": state.session_id,
+                    "at_event_id": state.at_event_id,
+                    "at_timestamp": state.at_timestamp.isoformat(),
+                    "source": state.source,
+                    "edits_applied": state.edits_applied,
+                    "content": state.content,
+                },
+                indent=2,
+                default=str,
+            ),
+        )
+    ]
+
+
+async def _tool_get_file_history(
+    store: LonghandStore, arguments: dict[str, Any]
+) -> list[TextContent]:
+    engine = ReplayEngine(store.sqlite)
+    full_session = None
+    if arguments.get("session_id"):
+        full_session = _resolve_prefix(store, arguments["session_id"])
+    edits = engine.file_history(arguments["file_path"], session_id=full_session)
+    formatted = [
+        {
+            "event_id": e["event_id"],
+            "session_id": e["session_id"],
+            "timestamp": e["timestamp"],
+            "tool_name": e.get("tool_name"),
+            "old_content": (e.get("old_content") or "")[:800],
+            "new_content": (e.get("new_content") or "")[:800],
+        }
+        for e in edits
+    ]
+    return [TextContent(type="text", text=json.dumps(formatted, indent=2, default=str))]
+
+
+async def _tool_get_stats(store: LonghandStore, arguments: dict[str, Any]) -> list[TextContent]:
+    stats = store.stats()
+    return [TextContent(type="text", text=json.dumps(stats, indent=2, default=str))]
+
+
+# ─── Proactive memory tools (v0.2) ─────────────────────────────────────
+
+
+async def _tool_recall(store: LonghandStore, arguments: dict[str, Any]) -> list[TextContent]:
+    result = recall_pipeline(
+        store=store,
+        query=_query(arguments.get("query")),
+        max_episodes=_limit(arguments.get("max_episodes"), 5),
+    )
+    payload = {
+        "query": result.query,
+        "project_matches": [
+            {
+                "project_id": m.project_id,
+                "display_name": m.display_name,
+                "category": m.category,
+                "canonical_path": m.canonical_path,
+                "score": m.score,
+                "reasons": m.reasons,
+            }
+            for m in result.project_matches
+        ],
+        "time_window": {
+            "since": result.time_window[0].isoformat() if result.time_window[0] else None,
+            "until": result.time_window[1].isoformat() if result.time_window[1] else None,
+        },
+        "episodes": result.episodes,
+        "segments": result.segments,
+        "narrative": result.narrative,
+    }
+    # Only include `artifacts` when populated — keeps the payload tight
+    # and makes the key's presence meaningful (indicates a fix event +
+    # linked file state were reconstructed for the top episode).
+    if result.artifacts:
+        payload["artifacts"] = result.artifacts
+    max_chars = _max_chars(arguments.get("max_chars"), 16000)
+    output = json.dumps(payload, indent=2, default=str)
+    return [TextContent(type="text", text=_truncate_output(output, max_chars, _HINT_RECALL))]
+
+
+async def _tool_recall_project_status(
+    store: LonghandStore, arguments: dict[str, Any]
+) -> list[TextContent]:
+    status = recall_project_status(
+        store=store,
+        project_name_or_id=arguments["project"],
+        max_commits=_limit(arguments.get("max_commits"), 10),
+        max_episodes=_limit(arguments.get("max_episodes"), 5),
+    )
+    if not status:
+        return [TextContent(type="text", text="No project matched.")]
+    payload = {
+        "project_id": status.project_id,
+        "display_name": status.display_name,
+        "canonical_path": status.canonical_path,
+        "category": status.category,
+        "active_branch": status.active_branch,
+        "last_commits": status.last_commits[:10],
+        "recent_sessions": [
+            {
+                "session_id": s.get("session_id"),
+                "started_at": s.get("started_at"),
+                "ended_at": s.get("ended_at"),
+                "event_count": s.get("event_count"),
+            }
+            for s in status.recent_sessions[:5]
+        ],
+        "recent_episodes": [
+            {
+                "episode_id": e.get("episode_id"),
+                "problem_description": (e.get("problem_description") or "")[:120],
+                "fix_summary": (e.get("fix_summary") or "")[:120],
+                "status": e.get("status"),
+                "ended_at": e.get("ended_at"),
+            }
+            for e in status.recent_episodes[:5]
+        ],
+        "unresolved_episodes": [
+            {
+                "episode_id": e.get("episode_id"),
+                "problem_description": (e.get("problem_description") or "")[:120],
+                "ended_at": e.get("ended_at"),
+            }
+            for e in status.unresolved_episodes[:5]
+        ],
+        "recent_segments": [
+            {
+                "segment_type": s.get("segment_type"),
+                "topic": (s.get("topic") or "")[:100],
+                "ended_at": s.get("ended_at"),
+            }
+            for s in status.recent_segments[:5]
+        ],
+        "last_outcome": status.last_outcome,
+        "narrative": status.narrative,
+        "session_count_indexed": status.session_count_indexed,
+        "session_count_on_disk": status.session_count_on_disk,
+        "last_ingested_at": status.last_ingested_at_iso,
+        "last_transcript_mtime": status.last_transcript_mtime_iso,
+        "stale": status.stale,
+        "stale_reason": status.stale_reason,
+    }
+    max_chars = _max_chars(arguments.get("max_chars"), 16000)
+    output = json.dumps(payload, indent=2, default=str)
+    return [TextContent(type="text", text=_truncate_output(output, max_chars, _HINT_RECALL))]
+
+
+async def _tool_match_project(store: LonghandStore, arguments: dict[str, Any]) -> list[TextContent]:
+    matches = match_projects(
+        store=store,
+        query=_query(arguments.get("query")),
+        top_k=_limit(arguments.get("top_k"), 5),
+    )
+    payload = [
+        {
+            "project_id": m.project_id,
+            "display_name": m.display_name,
+            "category": m.category,
+            "canonical_path": m.canonical_path,
+            "score": m.score,
+            "reasons": m.reasons,
+        }
+        for m in matches
+    ]
+    return [TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
+
+
+async def _tool_find_episodes(store: LonghandStore, arguments: dict[str, Any]) -> list[TextContent]:
+    # episode_id detail mode absorbs the old get_episode.
+    if arguments.get("episode_id"):
+        return await _tool_get_episode(store, arguments)
+
+    # has_fix=True (the default) filters in SQL; False means "no filter",
+    # matching the old post-filter semantics (include fixless episodes too).
+    # min_confidence defaults to 0.5 — the extractor's floor for episodes
+    # with real structural evidence; pass 0 to see everything.
+    try:
+        min_conf = float(arguments.get("min_confidence", 0.5))
+    except (TypeError, ValueError):
+        min_conf = 0.5
+    episodes = store.sqlite.query_episodes(
+        project_ids=arguments.get("project_ids"),
+        since=arguments.get("since"),
+        until=arguments.get("until"),
+        keyword=arguments.get("keyword"),
+        has_fix=True if _bool(arguments.get("has_fix"), True) else None,
+        min_confidence=min_conf if min_conf > 0 else None,
+        limit=_limit(arguments.get("limit"), 20),
+    )
+    return [TextContent(type="text", text=json.dumps(episodes, indent=2, default=str))]
+
+
+async def _tool_get_episode(store: LonghandStore, arguments: dict[str, Any]) -> list[TextContent]:
+    ep = store.sqlite.get_episode(arguments["episode_id"])
+    if not ep:
+        return [TextContent(type="text", text=f"No episode: {arguments['episode_id']}")]
+
+    # Load related events and artifacts
+    payload: dict[str, Any] = {"episode": ep}
+    for field, key in [
+        ("problem_event_id", "problem_event"),
+        ("diagnosis_event_id", "diagnosis_event"),
+        ("fix_event_id", "fix_event"),
+        ("verification_event_id", "verification_event"),
+    ]:
+        eid = ep.get(field)
+        if eid:
+            evt = store.sqlite.get_event(eid)
+            if evt:
+                payload[key] = _format_event(evt)
+
+    # Reconstructed file state after fix
+    fix_id = ep.get("fix_event_id")
+    if fix_id:
+        fix_event = store.sqlite.get_event(fix_id)
+        if fix_event and fix_event.get("file_path"):
+            engine = ReplayEngine(store.sqlite)
+            try:
+                state = engine.file_state_at(
+                    file_path=fix_event["file_path"],
+                    session_id=ep["session_id"],
+                    at_event_id=fix_id,
+                )
+                if state:
+                    payload["file_state_after"] = {
+                        "file_path": state.file_path,
+                        "content": state.content,
+                        "edits_applied": state.edits_applied,
+                    }
+            except Exception:
+                pass
+
+    return [TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
+
+
+async def _tool_get_session_commits(
+    store: LonghandStore, arguments: dict[str, Any]
+) -> list[TextContent]:
+    full_id = _resolve_prefix(store, arguments["session_id"])
+    if not full_id:
+        return [TextContent(type="text", text=f"No session matching: {arguments['session_id']}")]
+    ops = store.sqlite.get_git_operations(
+        session_id=full_id,
+        operation_type=arguments.get("operation_type"),
+        limit=_limit(arguments.get("limit"), 100),
+    )
+    max_chars = _max_chars(arguments.get("max_chars"), 12000)
+    output = json.dumps(ops, indent=2, default=str)
+    return [TextContent(type="text", text=_truncate_output(output, max_chars, _HINT_GIT))]
+
+
+async def _tool_find_commits(store: LonghandStore, arguments: dict[str, Any]) -> list[TextContent]:
+    # No query + session_id absorbs the old get_session_commits (chronological).
+    if not (arguments.get("query") or "").strip():
+        if not arguments.get("session_id"):
+            return [TextContent(type="text", text="Pass a query, a session_id, or both.")]
+        return await _tool_get_session_commits(store, arguments)
+
+    search_session_id = None
+    if arguments.get("session_id"):
+        search_session_id = _resolve_prefix(store, arguments["session_id"])
+    ops = store.sqlite.search_git_operations(
+        query=_query(arguments.get("query")),
+        session_id=search_session_id,
+        operation_type=arguments.get("operation_type"),
+        limit=_limit(arguments.get("limit"), 20),
+    )
+    max_chars = _max_chars(arguments.get("max_chars"), 12000)
+    output = json.dumps(ops, indent=2, default=str)
+    return [TextContent(type="text", text=_truncate_output(output, max_chars, _HINT_GIT))]
+
+
+async def _tool_list_projects(store: LonghandStore, arguments: dict[str, Any]) -> list[TextContent]:
+    # match mode absorbs the old match_project (fuzzy, with scored reasons).
+    if arguments.get("match"):
+        return await _tool_match_project(
+            store, {"query": arguments["match"], "top_k": arguments.get("limit", 5)}
+        )
+
+    rows = store.sqlite.list_projects(
+        keyword=arguments.get("keyword"),
+        category=arguments.get("category"),
+        limit=_limit(arguments.get("limit"), 20),
+    )
+    if _bool(arguments.get("verbose"), False):
+        output = json.dumps(rows, indent=2, default=str)
+    else:
+        output = json.dumps([_format_project_compact(r) for r in rows], indent=2, default=str)
+    return [TextContent(type="text", text=_truncate_output(output, 16000, _HINT_PROJECTS))]
+
+
+async def _tool_get_project_timeline(
+    store: LonghandStore, arguments: dict[str, Any]
+) -> list[TextContent]:
+    rows = store.sqlite.list_sessions(
+        project_id=arguments["project_id"],
+        since=arguments.get("since"),
+        until=arguments.get("until"),
+        limit=_limit(arguments.get("limit"), 50),
+    )
+    # Enrich with outcome
+    enriched = []
+    for r in rows:
+        outcome = store.sqlite.get_outcome(r["session_id"])
+        enriched.append(
+            {
+                **r,
+                "outcome": outcome["outcome"] if outcome else None,
+                "outcome_summary": outcome["summary"] if outcome else None,
+            }
+        )
+    return [TextContent(type="text", text=json.dumps(enriched, indent=2, default=str))]
+
+
+async def _tool_reconcile(store: LonghandStore, arguments: dict[str, Any]) -> list[TextContent]:
+    """Bridge disk↔DB drift from inside an MCP session.
+
+    Defaults to a dry run: reports on-disk transcripts that are missing from
+    the sessions table or have NULL project_id, without touching anything.
+    Pass `fix=true` to re-ingest them, closing the loop so Claude can self-heal
+    the index after a staleness banner fires, without shelling out to the CLI.
+
+    The default flipped from fix=true at 1.0, warned one full minor ahead by
+    the 0.13 in-payload deprecation notice (Promise 1).
+    """
+    fix = _bool(arguments.get("fix"), False)
+    report = run_reconcile(store, fix=fix)
+    payload = report.to_dict()
+    if not fix:
+        payload["hint"] = "pass fix=true to apply"
+    output = json.dumps(payload, indent=2, default=str)
+    return [TextContent(type="text", text=output)]
+
+
+async def _tool_list_plans(store: LonghandStore, arguments: dict[str, Any]) -> list[TextContent]:
+    rows = store.sqlite.list_plans(limit=_limit(arguments.get("limit"), 50))
+    return [TextContent(type="text", text=json.dumps(rows, indent=2, default=str))]
+
+
+# Retired tool → the surviving call shape that replaces it. Through 0.13 the
+# retired names stay in list_tools() with a [DEPRECATED] description prefix;
+# at 1.0 they leave the listing but KEEP answering here forever (with the
+# migration preamble) so stale user CLAUDE.md files never hard-fail.
+_RETIRED_TOOLS: dict[str, str] = {
+    "search_in_context": "search (pass context_events with session_id)",
+    "get_project_timeline": "list_sessions (pass project_id, optionally since/until)",
+    "get_latest_events": "get_session_timeline (pass tail)",
+    "get_session_commits": "find_commits (pass session_id, omit query)",
+    "get_episode": "find_episodes (pass episode_id)",
+    "match_project": "list_projects (pass match)",
+}
+
+
+def _deprecated_tool(name: str, handler: Any) -> Any:
+    """Wrap a retired tool: same behavior, plus a one-line migration preamble."""
+
+    async def _wrapped(store: LonghandStore, arguments: dict[str, Any]) -> list[TextContent]:
+        result = await handler(store, arguments)
+        preamble = f"[DEPRECATED] {name} is retired — use {_RETIRED_TOOLS[name]} instead.\n"
+        return [TextContent(type="text", text=preamble + tc.text) for tc in result]
+
+    return _wrapped
+
+
+_DISPATCH: dict[str, Any] = {
+    "search": _tool_search,
+    "search_in_context": _deprecated_tool("search_in_context", _tool_search_in_context),
+    "list_sessions": _tool_list_sessions,
+    "get_session_timeline": _tool_get_session_timeline,
+    "get_latest_events": _deprecated_tool("get_latest_events", _tool_get_latest_events),
+    "replay_file": _tool_replay_file,
+    "get_file_history": _tool_get_file_history,
+    "get_stats": _tool_get_stats,
+    "recall": _tool_recall,
+    "recall_project_status": _tool_recall_project_status,
+    "reconcile": _tool_reconcile,
+    "match_project": _deprecated_tool("match_project", _tool_match_project),
+    "find_episodes": _tool_find_episodes,
+    "get_episode": _deprecated_tool("get_episode", _tool_get_episode),
+    "get_session_commits": _deprecated_tool("get_session_commits", _tool_get_session_commits),
+    "find_commits": _tool_find_commits,
+    "list_projects": _tool_list_projects,
+    "get_project_timeline": _deprecated_tool("get_project_timeline", _tool_get_project_timeline),
+    "list_plans": _tool_list_plans,
+}
+
+
+_STORE: LonghandStore | None = None
+
+
+def _shared_store() -> LonghandStore:
+    """One store for the server's lifetime — constructing per call re-ran
+    migrations and re-opened ChromaDB on every tool invocation."""
+    global _STORE
+    if _STORE is None:
+        _STORE = LonghandStore()
+    return _STORE
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    handler = _DISPATCH.get(name)
+    if handler is None:
+        return [TextContent(type="text", text=f"Unknown tool: {name}")]
+    try:
+        return await handler(_shared_store(), arguments)
+    except Exception as e:
+        # Top-level envelope: a failing tool must hand the agent a readable
+        # error instead of surfacing a raw traceback through the MCP layer.
+        payload = {"error": f"{type(e).__name__}: {e}", "tool": name}
+        return [TextContent(type="text", text=json.dumps(payload))]
+
+
+async def main():
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream,
+            write_stream,
+            server.create_initialization_options(),
+        )
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    asyncio.run(main())

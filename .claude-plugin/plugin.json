@@ -1,0 +1,21 @@
+{
+  "name": "longhand",
+  "version": "1.3.0",
+  "description": "Persistent local memory for Claude Code. Every tool call, every file edit, every thinking block from every session \u2014 stored verbatim on your machine. Semantic recall in ~128ms median with zero API calls.",
+  "author": {
+    "name": "Nate Nelson",
+    "url": "https://github.com/Wynelson94"
+  },
+  "homepage": "https://github.com/Wynelson94/longhand",
+  "repository": "https://github.com/Wynelson94/longhand",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "recall",
+    "mcp",
+    "local",
+    "session-history",
+    "forensic",
+    "search"
+  ]
+}

@@ -1,0 +1,513 @@
+{
+  "bsoi-mesh-kit material profiles": {
+    "episodes": [
+      {
+        "distance": 1.2642,
+        "episode_id": "ep_85ba831298fc6da2",
+        "rank": 0,
+        "session_id": "d1801a3e-2744-42dd-b151-b683cca63276"
+      },
+      {
+        "distance": 1.3554,
+        "episode_id": "ep_38bc9e734d4ca3c5",
+        "rank": 1,
+        "session_id": "8eea2770-97b6-45e2-90b6-7fe275bf6ac7"
+      },
+      {
+        "distance": 1.4365,
+        "episode_id": "ep_f7c2f2a919431889",
+        "rank": 2,
+        "session_id": "8eea2770-97b6-45e2-90b6-7fe275bf6ac7"
+      },
+      {
+        "distance": 1.1403,
+        "episode_id": "ep_4b1f9d109afc9a6d",
+        "rank": 3,
+        "session_id": "503c2815-8c7f-46ca-acd9-fe62ae0ea4e9"
+      },
+      {
+        "distance": 1.4846,
+        "episode_id": "ep_8443b840bc68edc4",
+        "rank": 4,
+        "session_id": "503c2815-8c7f-46ca-acd9-fe62ae0ea4e9"
+      }
+    ],
+    "narrative_session_prefixes": [
+      "2d8b7ee4",
+      "823dd358",
+      "9e9f4ac9",
+      "d1801a3e"
+    ],
+    "segments": [
+      {
+        "distance": 0.8412,
+        "rank": 0,
+        "segment_id": "seg_737efea789f72f4d",
+        "session_id": "9e9f4ac9-0dea-4846-b709-5c095d82365a"
+      },
+      {
+        "distance": 1.0372,
+        "rank": 1,
+        "segment_id": "seg_19fd1d8011e4adbc",
+        "session_id": "2d8b7ee4-b644-4bee-9c09-710b928920c2"
+      },
+      {
+        "distance": 1.1122,
+        "rank": 2,
+        "segment_id": "seg_e5be9f0ec357dada",
+        "session_id": "823dd358-f32f-4d73-a481-38a05b378966"
+      },
+      {
+        "distance": 1.1175,
+        "rank": 3,
+        "segment_id": "seg_dd21e08d82ae3d55",
+        "session_id": "7b5c384a-b27e-4c48-9faf-aaef7b9dd94c"
+      },
+      {
+        "distance": 1.1333,
+        "rank": 4,
+        "segment_id": "seg_1e1e4fa0241ae4fd",
+        "session_id": "823dd358-f32f-4d73-a481-38a05b378966"
+      }
+    ]
+  },
+  "ledger smoke test findings": {
+    "episodes": [
+      {
+        "distance": 1.3114,
+        "episode_id": "ep_406186b0fc500a6d",
+        "rank": 0,
+        "session_id": "e6a468ef-ce7f-419f-b1f1-3c07bf9f46e1"
+      },
+      {
+        "distance": 1.5528,
+        "episode_id": "ep_d9bb0e7c16e0253d",
+        "rank": 1,
+        "session_id": "69f46fa2-ac70-42d0-a61d-54c89ee49fa3"
+      },
+      {
+        "distance": 1.5532,
+        "episode_id": "ep_5d7d98e3fe5a6850",
+        "rank": 2,
+        "session_id": "a44b23e2-b590-4a98-a1a5-59eaae1446fa"
+      },
+      {
+        "distance": 1.3121,
+        "episode_id": "ep_590554e6bca3e5ef",
+        "rank": 3,
+        "session_id": "a353ccfe-136d-416b-968f-2b3af45ee427"
+      },
+      {
+        "distance": 1.4312,
+        "episode_id": "ep_e45f43c7ee62b83a",
+        "rank": 4,
+        "session_id": "316fd0da-03de-4b75-8d28-c486d98d3376"
+      }
+    ],
+    "narrative_session_prefixes": [
+      "0bc0297c",
+      "b94a3b0a",
+      "df3c039c",
+      "e6a468ef"
+    ],
+    "segments": [
+      {
+        "distance": 1.0569,
+        "rank": 0,
+        "segment_id": "seg_49afcc10708f9762",
+        "session_id": "df3c039c-8766-40bc-8b4e-109f2cc51443"
+      },
+      {
+        "distance": 1.1592,
+        "rank": 1,
+        "segment_id": "seg_466624a7974c36ef",
+        "session_id": "e6a468ef-ce7f-419f-b1f1-3c07bf9f46e1"
+      },
+      {
+        "distance": 1.1598,
+        "rank": 2,
+        "segment_id": "seg_03cbbb4b595514be",
+        "session_id": "0bc0297c-7e96-4c41-8d27-56d653506df9"
+      },
+      {
+        "distance": 1.1952,
+        "rank": 3,
+        "segment_id": "seg_5e087f5b479d0b9c",
+        "session_id": "b94a3b0a-fd93-4dc6-ad80-f15e195f27cf"
+      },
+      {
+        "distance": 1.2368,
+        "rank": 4,
+        "segment_id": "seg_ff9bc1ad80ce70d5",
+        "session_id": "30511358-22d1-4889-9f7d-56077b0d1dca"
+      }
+    ]
+  },
+  "longhand v0.8 future plans": {
+    "episodes": [
+      {
+        "distance": 1.2668,
+        "episode_id": "ep_fa7958c4935ce042",
+        "rank": 0,
+        "session_id": "58df5093-a591-4d1d-a5aa-2006dbcfbd1f"
+      },
+      {
+        "distance": 1.4669,
+        "episode_id": "ep_5fe0901cee1ab7d3",
+        "rank": 1,
+        "session_id": "7b4515c8-f335-4511-8a3b-972121852664"
+      },
+      {
+        "distance": 1.4678,
+        "episode_id": "ep_bce71df1db740022",
+        "rank": 2,
+        "session_id": "28303e12-96bb-4827-9b0d-83298d3a53bc"
+      },
+      {
+        "distance": 1.3931,
+        "episode_id": "ep_07eda27b0823082e",
+        "rank": 3,
+        "session_id": "a44b23e2-b590-4a98-a1a5-59eaae1446fa"
+      },
+      {
+        "distance": 1.5261,
+        "episode_id": "ep_decea735a79b3e86",
+        "rank": 4,
+        "session_id": "a44b23e2-b590-4a98-a1a5-59eaae1446fa"
+      }
+    ],
+    "narrative_session_prefixes": [
+      "4aaf4f48",
+      "58df5093",
+      "eef364a9"
+    ],
+    "segments": [
+      {
+        "distance": 0.9959,
+        "rank": 0,
+        "segment_id": "seg_f30d14e6fcd0a1f0",
+        "session_id": "a44b23e2-b590-4a98-a1a5-59eaae1446fa"
+      },
+      {
+        "distance": 1.0845,
+        "rank": 1,
+        "segment_id": "seg_85babee3f1d170f4",
+        "session_id": "4aaf4f48-b84f-4b56-9fbe-106778db9564"
+      },
+      {
+        "distance": 1.1183,
+        "rank": 2,
+        "segment_id": "seg_dd71ac12495b2367",
+        "session_id": "28303e12-96bb-4827-9b0d-83298d3a53bc"
+      },
+      {
+        "distance": 1.1495,
+        "rank": 3,
+        "segment_id": "seg_951a75cd1287b90a",
+        "session_id": "a44b23e2-b590-4a98-a1a5-59eaae1446fa"
+      },
+      {
+        "distance": 1.1575,
+        "rank": 4,
+        "segment_id": "seg_b1609151490a2785",
+        "session_id": "eef364a9-265a-43e3-ad44-5a8c9e743e92"
+      }
+    ]
+  },
+  "project inference home cd attribution": {
+    "episodes": [
+      {
+        "distance": 1.4642,
+        "episode_id": "ep_bbede5a6dc49aeed",
+        "rank": 0,
+        "session_id": "4d9d5ac2-a57a-47b5-b032-d77903aace85"
+      },
+      {
+        "distance": 1.6698,
+        "episode_id": "ep_7ab5bf1dae0a886c",
+        "rank": 1,
+        "session_id": "a29849d5-334a-4dc5-a724-3ff7b65c06ce"
+      },
+      {
+        "distance": 1.5316,
+        "episode_id": "ep_a830a6e01e62dfc3",
+        "rank": 2,
+        "session_id": "6176e558-1a72-4f63-bebf-efd6bc898a2c"
+      },
+      {
+        "distance": 1.5697,
+        "episode_id": "ep_99cfdedd25920b02",
+        "rank": 3,
+        "session_id": "50aae759-445e-47b7-812b-d2c7404e4578"
+      },
+      {
+        "distance": 1.6586,
+        "episode_id": "ep_3ebac1dd6c00528b",
+        "rank": 4,
+        "session_id": "766be4db-481e-4502-ada2-72c2161bf965"
+      }
+    ],
+    "narrative_session_prefixes": [
+      "4d9d5ac2",
+      "ca06d28b",
+      "fae52c08",
+      "ff35152d"
+    ],
+    "segments": [
+      {
+        "distance": 1.2505,
+        "rank": 0,
+        "segment_id": "seg_ba188e7849ed9192",
+        "session_id": "ff35152d-772a-4262-88ac-9199424f7ea4"
+      },
+      {
+        "distance": 1.2626,
+        "rank": 1,
+        "segment_id": "seg_44408815a8776e6b",
+        "session_id": "ca06d28b-6989-4451-aa8c-7753592fd97a"
+      },
+      {
+        "distance": 1.2733,
+        "rank": 2,
+        "segment_id": "seg_ceb60df949ec369d",
+        "session_id": "fae52c08-83df-466f-8f7d-a53c2deafd0b"
+      },
+      {
+        "distance": 1.2902,
+        "rank": 3,
+        "segment_id": "seg_11ac0231c29945e2",
+        "session_id": "6176e558-1a72-4f63-bebf-efd6bc898a2c"
+      },
+      {
+        "distance": 1.2911,
+        "rank": 4,
+        "segment_id": "seg_d0d711a6d7ec5073",
+        "session_id": "bdaac329-1af0-42a4-bea7-7afc098f46f2"
+      }
+    ]
+  },
+  "secondary match recall fix": {
+    "episodes": [
+      {
+        "distance": 1.0309,
+        "episode_id": "ep_6390d04799973fe5",
+        "rank": 0,
+        "session_id": "0f975ac8-339a-44bf-8dba-bd13ffbcc2bd"
+      },
+      {
+        "distance": 1.4083,
+        "episode_id": "ep_fb6710782a025ed7",
+        "rank": 1,
+        "session_id": "0f975ac8-339a-44bf-8dba-bd13ffbcc2bd"
+      },
+      {
+        "distance": 1.4247,
+        "episode_id": "ep_91cda70b75f155b3",
+        "rank": 2,
+        "session_id": "9fea8fa4-0c7c-438b-b66f-ae01e8a84ce1"
+      },
+      {
+        "distance": 1.2303,
+        "episode_id": "ep_50b4f4cd354cbf5b",
+        "rank": 3,
+        "session_id": "e2e29540-590c-4e89-9d1e-f60b6899c368"
+      },
+      {
+        "distance": 1.2306,
+        "episode_id": "ep_b491149d828124e8",
+        "rank": 4,
+        "session_id": "0f975ac8-339a-44bf-8dba-bd13ffbcc2bd"
+      }
+    ],
+    "narrative_session_prefixes": [
+      "0b810af9",
+      "0f975ac8",
+      "65e3c3ee"
+    ],
+    "segments": [
+      {
+        "distance": 1.107,
+        "rank": 0,
+        "segment_id": "seg_1cbb3d442be271ad",
+        "session_id": "65e3c3ee-f95e-493c-a6f4-21f2eabfe10d"
+      },
+      {
+        "distance": 1.1079,
+        "rank": 1,
+        "segment_id": "seg_e06dcdda66e7797f",
+        "session_id": "0f975ac8-339a-44bf-8dba-bd13ffbcc2bd"
+      },
+      {
+        "distance": 1.117,
+        "rank": 2,
+        "segment_id": "seg_25a97f9bc9158987",
+        "session_id": "65e3c3ee-f95e-493c-a6f4-21f2eabfe10d"
+      },
+      {
+        "distance": 1.1683,
+        "rank": 3,
+        "segment_id": "seg_4e22d5a15a6d4bce",
+        "session_id": "0b810af9-3eda-468a-b138-3022a5f61601"
+      },
+      {
+        "distance": 1.1697,
+        "rank": 4,
+        "segment_id": "seg_aa832a455ffcdb10",
+        "session_id": "65e3c3ee-f95e-493c-a6f4-21f2eabfe10d"
+      }
+    ]
+  },
+  "shipwright first build grid talk": {
+    "episodes": [],
+    "narrative_session_prefixes": [
+      "2901f511",
+      "b3e1506e",
+      "fae52c08"
+    ],
+    "segments": [
+      {
+        "distance": 0.9249,
+        "rank": 0,
+        "segment_id": "seg_f2289e0497902d98",
+        "session_id": "fae52c08-83df-466f-8f7d-a53c2deafd0b"
+      },
+      {
+        "distance": 0.9319,
+        "rank": 1,
+        "segment_id": "seg_7372a3a8b1aa5f5c",
+        "session_id": "fae52c08-83df-466f-8f7d-a53c2deafd0b"
+      },
+      {
+        "distance": 1.1353,
+        "rank": 2,
+        "segment_id": "seg_16ecc131edaac8f1",
+        "session_id": "2901f511-0a85-4b7a-870a-26be43417e57"
+      },
+      {
+        "distance": 1.1402,
+        "rank": 3,
+        "segment_id": "seg_91eb4ed1e378e2c5",
+        "session_id": "b3e1506e-0433-4a24-8c2c-ec2660d5324b"
+      },
+      {
+        "distance": 1.2019,
+        "rank": 4,
+        "segment_id": "seg_34df731c8cde9743",
+        "session_id": "2901f511-0a85-4b7a-870a-26be43417e57"
+      }
+    ]
+  },
+  "the recall miss bug": {
+    "episodes": [
+      {
+        "distance": 1.4325,
+        "episode_id": "ep_be4b8caac595e96d",
+        "rank": 0,
+        "session_id": "0b810af9-3eda-468a-b138-3022a5f61601"
+      },
+      {
+        "distance": 1.2882,
+        "episode_id": "ep_9ee180e4eb02d6e3",
+        "rank": 1,
+        "session_id": "a44b23e2-b590-4a98-a1a5-59eaae1446fa"
+      },
+      {
+        "distance": 1.1401,
+        "episode_id": "ep_50b4f4cd354cbf5b",
+        "rank": 2,
+        "session_id": "e2e29540-590c-4e89-9d1e-f60b6899c368"
+      },
+      {
+        "distance": 1.1339,
+        "episode_id": "ep_04519196cc8a0991",
+        "rank": 3,
+        "session_id": "419ca408-722b-4e19-849b-52bbebf67f2d"
+      },
+      {
+        "distance": 1.1323,
+        "episode_id": "ep_6390d04799973fe5",
+        "rank": 4,
+        "session_id": "0f975ac8-339a-44bf-8dba-bd13ffbcc2bd"
+      }
+    ],
+    "narrative_session_prefixes": [
+      "0b810af9",
+      "65e3c3ee",
+      "7b4515c8",
+      "f3ba67ab"
+    ],
+    "segments": [
+      {
+        "distance": 0.8604,
+        "rank": 0,
+        "segment_id": "seg_93aaf0ce7791d8be",
+        "session_id": "7b4515c8-f335-4511-8a3b-972121852664"
+      },
+      {
+        "distance": 0.9183,
+        "rank": 1,
+        "segment_id": "seg_25a97f9bc9158987",
+        "session_id": "65e3c3ee-f95e-493c-a6f4-21f2eabfe10d"
+      },
+      {
+        "distance": 0.9574,
+        "rank": 2,
+        "segment_id": "seg_68bb254d8e58a2af",
+        "session_id": "f3ba67ab-5d8d-4e5a-ad47-1b3773ad59ac"
+      },
+      {
+        "distance": 0.9822,
+        "rank": 3,
+        "segment_id": "seg_3c002b3f1ef8dd93",
+        "session_id": "e8085741-c991-48f0-a1c9-81cf8580dc70"
+      },
+      {
+        "distance": 1.0683,
+        "rank": 4,
+        "segment_id": "seg_4a88b3a2ab62bc74",
+        "session_id": "4aaf4f48-b84f-4b56-9fbe-106778db9564"
+      }
+    ]
+  },
+  "what did we ship in v0.6": {
+    "episodes": [],
+    "narrative_session_prefixes": [
+      "27ae09fe",
+      "69f46fa2",
+      "9060e5df",
+      "eaafe447"
+    ],
+    "segments": [
+      {
+        "distance": 1.102,
+        "rank": 0,
+        "segment_id": "seg_5c2eefce501990ae",
+        "session_id": "27ae09fe-aeb7-45bd-bc78-1135b2b48e38"
+      },
+      {
+        "distance": 1.1195,
+        "rank": 1,
+        "segment_id": "seg_3fbf1a083ac623a7",
+        "session_id": "69f46fa2-ac70-42d0-a61d-54c89ee49fa3"
+      },
+      {
+        "distance": 1.2483,
+        "rank": 2,
+        "segment_id": "seg_f552b9ee424c7f1f",
+        "session_id": "eaafe447-7047-4348-ae6f-6c4c07cca506"
+      },
+      {
+        "distance": 1.2494,
+        "rank": 3,
+        "segment_id": "seg_e44c9c06791aa8c3",
+        "session_id": "9060e5df-038c-486d-8fce-93588ffa8912"
+      },
+      {
+        "distance": 1.2548,
+        "rank": 4,
+        "segment_id": "seg_a17a2cb4797e6089",
+        "session_id": "69f46fa2-ac70-42d0-a61d-54c89ee49fa3"
+      }
+    ]
+  }
+}
