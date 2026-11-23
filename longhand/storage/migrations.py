@@ -1,0 +1,361 @@
+"""
+Schema migrations for Longhand.
+
+Version-aware SQL evolution. Each migration is a SQL string keyed by version.
+Migrations are applied in order, once, and logged in the `schema_version` table.
+
+Migration authoring policy (1.0, Promise 2 — forward data compat)
+-----------------------------------------------------------------
+Promise 2 says any DB written by 0.11+ opens on any 1.x at least as new as its
+last writer. These rules are what make that true; see COMPATIBILITY.md.
+
+1. **Automatic.** Migrations apply on store open. A user never runs a command
+   to make their existing database work with a newer Longhand.
+2. **One-time.** Applied once, recorded in `schema_version`, never re-run.
+3. **Never renumbered.** A published version number is frozen forever — its
+   content included. Fixing a shipped migration means adding a new one, not
+   editing history: renumbering silently re-applies or silently skips,
+   depending on which side of the number a given user sits.
+4. **Bounded work on open.** Anything beyond O(1) DDL — a data rewrite that
+   walks every row — must not run inline at open. Ship it chunked with
+   progress, or behind an opt-in `db migrate-*` command. Store open is on the
+   hook path; an unbounded migration there blocks a user's prompt.
+5. **Never destructive without opt-in.** No migration drops a column, deletes
+   rows, or discards data a previous version wrote. Additive only; if data
+   must be reshaped, write the new shape alongside and leave the old.
+6. **Every migration ships a prior-schema fixture test** — a real dump of the
+   schema as it existed *before* the migration, committed under
+   `tests/fixtures/db/`, loaded and migrated in a test. Hand-written schemas
+   drift from reality and prove nothing.
+
+M1-M8 predate this policy and are grandfathered: they are already published,
+so rule 3 freezes them as-is. The policy binds M9 onward.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import time
+
+from longhand.timeutil import utcnow
+
+MIGRATIONS: dict[int, str] = {
+    1: """
+    -- v1: proactive memory schema additions
+
+    CREATE TABLE IF NOT EXISTS projects (
+        project_id TEXT PRIMARY KEY,
+        canonical_path TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        aliases_json TEXT NOT NULL,
+        keywords_json TEXT NOT NULL,
+        languages_json TEXT NOT NULL,
+        category TEXT,
+        first_seen TEXT NOT NULL,
+        last_seen TEXT NOT NULL,
+        session_count INTEGER DEFAULT 0,
+        total_edits INTEGER DEFAULT 0
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_projects_last_seen ON projects(last_seen DESC);
+    CREATE INDEX IF NOT EXISTS idx_projects_category ON projects(category);
+
+    -- sessions.project_id is added by the migration runner as an ALTER
+    -- because ALTER TABLE with ADD COLUMN is idempotent-friendly only in newer SQLite.
+
+    CREATE TABLE IF NOT EXISTS session_outcomes (
+        session_id TEXT PRIMARY KEY,
+        outcome TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        error_count INTEGER DEFAULT 0,
+        fix_count INTEGER DEFAULT 0,
+        test_pass_count INTEGER DEFAULT 0,
+        test_fail_count INTEGER DEFAULT 0,
+        first_error_event_id TEXT,
+        resolution_event_id TEXT,
+        summary TEXT NOT NULL,
+        topics_json TEXT NOT NULL,
+        computed_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_outcomes_outcome ON session_outcomes(outcome);
+
+    CREATE TABLE IF NOT EXISTS episodes (
+        episode_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        project_id TEXT,
+        started_at TEXT NOT NULL,
+        ended_at TEXT NOT NULL,
+        problem_event_id TEXT,
+        diagnosis_event_id TEXT,
+        fix_event_id TEXT,
+        verification_event_id TEXT,
+        problem_description TEXT,
+        diagnosis_summary TEXT,
+        fix_summary TEXT,
+        touched_files_json TEXT,
+        tags_json TEXT,
+        confidence REAL DEFAULT 0.5,
+        status TEXT DEFAULT 'unresolved'
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_episodes_project ON episodes(project_id);
+    CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_id);
+    CREATE INDEX IF NOT EXISTS idx_episodes_ended_at ON episodes(ended_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status);
+
+    CREATE TABLE IF NOT EXISTS tool_pairs (
+        tool_use_id TEXT PRIMARY KEY,
+        call_event_id TEXT NOT NULL,
+        result_event_id TEXT,
+        success INTEGER,
+        error_detected INTEGER DEFAULT 0,
+        error_snippet TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tool_pairs_call ON tool_pairs(call_event_id);
+    CREATE INDEX IF NOT EXISTS idx_tool_pairs_error ON tool_pairs(error_detected) WHERE error_detected = 1;
+    """,
+    2: """
+    -- v2: git operation tracking
+
+    CREATE TABLE IF NOT EXISTS git_operations (
+        git_op_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        operation_type TEXT NOT NULL,
+        commit_hash TEXT,
+        commit_message TEXT,
+        branch TEXT,
+        remote TEXT,
+        files_changed_count INTEGER,
+        timestamp TEXT NOT NULL,
+        success INTEGER NOT NULL DEFAULT 1
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_git_ops_session ON git_operations(session_id, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_git_ops_hash ON git_operations(commit_hash) WHERE commit_hash IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_git_ops_type ON git_operations(operation_type);
+    """,
+    3: """
+    -- v3: conversation segment extraction for non-episode recall
+
+    CREATE TABLE IF NOT EXISTS conversation_segments (
+        segment_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        project_id TEXT,
+        started_at TEXT NOT NULL,
+        ended_at TEXT NOT NULL,
+        start_sequence INTEGER NOT NULL,
+        end_sequence INTEGER NOT NULL,
+        segment_type TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        event_count INTEGER NOT NULL,
+        user_message_count INTEGER NOT NULL,
+        keywords_json TEXT NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_segments_session ON conversation_segments(session_id);
+    CREATE INDEX IF NOT EXISTS idx_segments_project ON conversation_segments(project_id);
+    CREATE INDEX IF NOT EXISTS idx_segments_ended_at ON conversation_segments(ended_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_segments_type ON conversation_segments(segment_type);
+    """,
+    4: """
+    -- v4: strip leaked Intent label from existing fix_summary rows.
+    -- See longhand/analysis/episode_extraction.py history for context.
+    -- 100 of 204 episodes (49%) had this on the reference corpus audit.
+
+    UPDATE episodes
+    SET fix_summary = substr(fix_summary, 9)
+    WHERE fix_summary LIKE 'Intent: %';
+    """,
+    5: """
+    -- v5: live-ingest support + plans_index view.
+    -- last_offset column is added by _apply_alters with column-existence guard.
+    -- Backfill (last_offset = file_size for existing rows) also runs there.
+
+    CREATE VIEW IF NOT EXISTS plans_index AS
+    SELECT
+        session_id,
+        event_id,
+        file_path,
+        timestamp,
+        length(new_content) AS bytes
+    FROM events
+    WHERE file_path LIKE '%/.claude/plans/%.md'
+      AND file_operation IN ('write', 'edit', 'multi_edit');
+    """,
+    6: """
+    -- v6: repair inflated projects.session_count / total_edits.
+    -- upsert_project() previously incremented both columns on every (re-)ingest
+    -- of a session, so they counted ingest events rather than distinct sessions
+    -- (e.g. the home-dir project showed 2,068 "sessions" against 264 real ones).
+    -- The recompute UPDATE runs in _apply_alters with table-existence guards,
+    -- since migrations may be applied before the base schema in standalone paths.
+    """,
+    7: """
+    -- v7: ingest atomicity — track how far the ingest pipeline got per
+    -- transcript so reconcile can spot crashes that landed the session row
+    -- but not the analysis. Values:
+    --   NULL       pre-0.12 row or live-tail cursor row (unknown; treated as
+    --              complete so upgrades don't trigger a re-analysis stampede)
+    --   'pending'  pipeline started but did not finish (crash) — repairable
+    --   'events'   core data landed, analysis deliberately skipped
+    --   'analyzed' full pipeline completed
+    -- The guarded ALTER runs in _apply_alters.
+    """,
+    8: """
+    -- v8: strip the leaked "Ask: " scaffold from stored problem descriptions.
+    -- The extractor prefixed every user ask with "Ask: " (embedding cue) and
+    -- it leaked into displayed text — same class as the v4 "Intent: " fix.
+    -- New extractions no longer write the prefix.
+
+    UPDATE episodes
+    SET problem_description = substr(problem_description, 6)
+    WHERE problem_description LIKE 'Ask: %';
+    """,
+}
+
+
+class SchemaTooNewError(RuntimeError):
+    """The database schema is newer than this longhand understands."""
+
+
+MAX_KNOWN_MIGRATION = max(MIGRATIONS)
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r[1] == column for r in rows)
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _apply_alters(conn: sqlite3.Connection, version: int) -> None:
+    """ALTER TABLE operations that need guarding (not idempotent across SQLite versions)."""
+    if version == 2:
+        if not _column_exists(conn, "episodes", "fix_commit_hash"):
+            conn.execute("ALTER TABLE episodes ADD COLUMN fix_commit_hash TEXT")
+    if version == 1:
+        if not _column_exists(conn, "sessions", "project_id"):
+            conn.execute("ALTER TABLE sessions ADD COLUMN project_id TEXT")
+        if not _column_exists(conn, "events", "error_detected"):
+            conn.execute("ALTER TABLE events ADD COLUMN error_detected INTEGER DEFAULT 0")
+        if not _column_exists(conn, "events", "error_snippet"):
+            conn.execute("ALTER TABLE events ADD COLUMN error_snippet TEXT")
+    if version == 5:
+        # last_offset = byte position parsed during live ingest. file_size still
+        # tracks the size at last full SessionEnd ingest, so already_ingested()
+        # short-circuits unchanged. Backfill last_offset = file_size so the
+        # first Stop hook after upgrade tails new bytes only.
+        # Guard on table existence: migrations may be applied before the base
+        # SCHEMA was loaded (test path that exercises apply_migrations alone).
+        if _table_exists(conn, "ingestion_log") and not _column_exists(
+            conn, "ingestion_log", "last_offset"
+        ):
+            conn.execute(
+                "ALTER TABLE ingestion_log ADD COLUMN last_offset INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.execute("UPDATE ingestion_log SET last_offset = file_size WHERE last_offset = 0")
+    if version == 7:
+        if _table_exists(conn, "ingestion_log") and not _column_exists(
+            conn, "ingestion_log", "analysis_stage"
+        ):
+            # NULL default on purpose: existing rows stay "unknown" and are
+            # treated as complete — flagging 300+ sessions as partial on
+            # upgrade would trigger a full re-analysis stampede.
+            conn.execute("ALTER TABLE ingestion_log ADD COLUMN analysis_stage TEXT")
+    if version == 6:
+        # One-time backfill: recompute the project rollups from the authoritative
+        # sessions table. Guarded on table existence because migrations may run
+        # before the base schema in standalone test paths.
+        if _table_exists(conn, "projects") and _table_exists(conn, "sessions"):
+            conn.execute(
+                """
+                UPDATE projects
+                SET session_count = (
+                        SELECT COUNT(*) FROM sessions
+                        WHERE sessions.project_id = projects.project_id
+                    ),
+                    total_edits = (
+                        SELECT COALESCE(SUM(file_edit_count), 0) FROM sessions
+                        WHERE sessions.project_id = projects.project_id
+                    )
+                """
+            )
+
+
+def _ensure_version_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _applied_versions(conn: sqlite3.Connection) -> set[int]:
+    rows = conn.execute("SELECT version FROM schema_version").fetchall()
+    return {r[0] for r in rows}
+
+
+def apply_migrations(conn: sqlite3.Connection) -> list[int]:
+    """Apply any unapplied migrations. Returns the list of versions applied this run.
+
+    Raises SchemaTooNewError when the database records a migration this build
+    has never heard of: operating blind against a newer schema risks silent
+    data damage, so downgraded code must refuse loudly instead.
+    """
+    _ensure_version_table(conn)
+    applied = _applied_versions(conn)
+
+    newest = max(applied, default=0)
+    if newest > MAX_KNOWN_MIGRATION:
+        raise SchemaTooNewError(
+            f"This database is at schema version {newest}, but this longhand only "
+            f"knows version {MAX_KNOWN_MIGRATION} — it was written by a newer longhand. "
+            "Refusing to operate blind. Upgrade with: pip install -U longhand"
+        )
+
+    newly_applied: list[int] = []
+    for version in sorted(MIGRATIONS.keys()):
+        if version in applied:
+            continue
+
+        sql = MIGRATIONS[version]
+        try:
+            conn.executescript(sql)
+            _apply_alters(conn, version)
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (version, utcnow().isoformat()),
+            )
+        except (sqlite3.IntegrityError, sqlite3.OperationalError):
+            # Two processes can race the same migration right after an
+            # upgrade (parallel session hooks, the MCP server, and the CLI
+            # all construct stores). The loser sees "already exists" /
+            # "duplicate column" from the DDL or a schema_version PK hit.
+            # Wait for the winner to record the version, then move on;
+            # only re-raise if it never lands (a genuine failure).
+            conn.rollback()
+            for _ in range(20):
+                if version in _applied_versions(conn):
+                    break
+                time.sleep(0.05)
+            else:
+                raise
+            continue
+        newly_applied.append(version)
+
+    conn.commit()
+    return newly_applied

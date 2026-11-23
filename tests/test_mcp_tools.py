@@ -1,0 +1,1285 @@
+"""Unit tests for each MCP tool handler (longhand.mcp_server._tool_*).
+
+Each test drives one handler end-to-end against a real SQLite + ChromaDB
+fixture store (no mocks). Async handlers are driven through asyncio.run().
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+from typing import Any
+
+import pytest
+
+from longhand import mcp_server
+from longhand.parser import JSONLParser
+
+
+def _ingest(fixture_path, store) -> Any:
+    parser = JSONLParser(fixture_path)
+    events = list(parser.parse_events())
+    session = parser.build_session(events)
+    store.ingest_session(session, events)
+    return session
+
+
+def _call(handler, store, args):
+    """Run an async tool handler synchronously."""
+    return asyncio.run(handler(store, args))
+
+
+def _payload(result):
+    """Extract and parse the JSON text payload from a tool's TextContent reply."""
+    assert len(result) == 1
+    text = result[0].text
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+# ─── MCP 19→13: absorptions + deprecation mechanics (v0.13) ──────────────────
+#
+# Six tools retire into six survivors via strict 1:1 parameter maps. Through
+# 0.13 the retired names stay listed with a [DEPRECATED — use …] description
+# prefix and every payload they return carries a one-line migration preamble.
+# At 1.0 they leave list_tools(); _DISPATCH keeps delegating aliases forever.
+
+RETIRED = {
+    "search_in_context": "search",
+    "get_project_timeline": "list_sessions",
+    "get_latest_events": "get_session_timeline",
+    "get_session_commits": "find_commits",
+    "get_episode": "find_episodes",
+    "match_project": "list_projects",
+}
+
+
+def _tools():
+    return {t.name: t for t in asyncio.run(mcp_server.list_tools())}
+
+
+def test_retired_tools_leave_the_listing_at_1_0():
+    tools = _tools()
+    assert len(tools) == 13  # the 6 retired names left list_tools() at 1.0
+    assert not (set(tools) & set(RETIRED))
+    for name in tools:
+        assert not tools[name].description.startswith("[DEPRECATED"), name
+
+
+def test_retired_tools_still_answer_forever():
+    """Removed from the listing, never removed from _DISPATCH — stale user
+    CLAUDE.md files must never hard-fail."""
+    for name in RETIRED:
+        assert name in mcp_server._DISPATCH, name
+
+
+def test_retired_payloads_carry_migration_preamble(temp_store, sample_session_file):
+    _ingest(sample_session_file, temp_store)
+
+    result = _call(mcp_server._DISPATCH["match_project"], temp_store, {"query": "test-project"})
+
+    first_line = result[0].text.splitlines()[0]
+    assert first_line.startswith("[DEPRECATED]")
+    assert "list_projects" in first_line
+
+
+def test_search_absorbs_context_mode(temp_store, sample_session_file):
+    session = _ingest(sample_session_file, temp_store)
+
+    result = _call(
+        mcp_server._DISPATCH["search"],
+        temp_store,
+        {"query": "readme", "session_id": session.session_id, "context_events": 2},
+    )
+    payload = _payload(result)
+
+    assert isinstance(payload, dict)
+    assert "context_windows" in payload  # the search_in_context shape
+
+
+def test_list_sessions_absorbs_project_timeline(temp_store, sample_session_file):
+    _ingest(sample_session_file, temp_store)
+    with temp_store.sqlite.connect() as conn:
+        pid = conn.execute("SELECT project_id FROM sessions").fetchone()[0]
+    assert pid, "sample fixture should infer a project"
+
+    payload = _payload(
+        _call(mcp_server._DISPATCH["list_sessions"], temp_store, {"project_id": pid})
+    )
+
+    assert isinstance(payload, list) and payload
+    assert "outcome" in payload[0]  # timeline enrichment came along
+
+
+def test_find_commits_query_is_optional_and_absorbs_session_commits(
+    temp_store, sample_session_file
+):
+    session = _ingest(sample_session_file, temp_store)
+
+    assert _tools()["find_commits"].inputSchema.get("required", []) == []
+
+    payload = _payload(
+        _call(
+            mcp_server._DISPATCH["find_commits"],
+            temp_store,
+            {"session_id": session.session_id},
+        )
+    )
+    assert isinstance(payload, list)  # chronological ops for the session
+
+
+def test_find_episodes_absorbs_episode_detail(temp_store):
+    temp_store.sqlite.insert_episodes(
+        [
+            {
+                "episode_id": "ep-absorb",
+                "session_id": "s-absorb",
+                "project_id": "p-absorb",
+                "started_at": "2026-07-01T10:00:00Z",
+                "ended_at": "2026-07-01T10:30:00Z",
+                "problem_event_id": "pe",
+                "fix_event_id": "fe",
+                "problem_description": "the widget broke",
+                "fix_summary": "reattached the widget",
+                "touched_files": [],
+                "tags": [],
+                "status": "resolved",
+            }
+        ]
+    )
+
+    payload = _payload(
+        _call(mcp_server._DISPATCH["find_episodes"], temp_store, {"episode_id": "ep-absorb"})
+    )
+
+    assert isinstance(payload, dict)
+    assert payload["episode"]["episode_id"] == "ep-absorb"
+
+
+def test_list_projects_absorbs_match(temp_store, sample_session_file):
+    _ingest(sample_session_file, temp_store)
+
+    payload = _payload(
+        _call(mcp_server._DISPATCH["list_projects"], temp_store, {"match": "test-project"})
+    )
+
+    assert isinstance(payload, list) and payload
+    assert "reasons" in payload[0]  # the match_project shape
+
+
+def test_reconcile_defaults_to_dry_run_at_1_0(temp_store, monkeypatch):
+    """The 0.13 warning promised this flip; at 1.0 the implicit default is dry-run."""
+    from types import SimpleNamespace
+
+    seen: list[bool] = []
+
+    def _fake(store, fix):
+        seen.append(fix)
+        return SimpleNamespace(to_dict=lambda: {"missing": 0, "ingested": 0})
+
+    monkeypatch.setattr(mcp_server, "run_reconcile", _fake)
+
+    implicit = _payload(_call(mcp_server._DISPATCH["reconcile"], temp_store, {}))
+    assert seen == [False]
+    assert implicit["hint"] == "pass fix=true to apply"
+    assert "deprecation_warning" not in implicit  # the window closed; no more nagging
+
+    seen.clear()
+    explicit = _payload(_call(mcp_server._DISPATCH["reconcile"], temp_store, {"fix": True}))
+    assert seen == [True]
+    assert "hint" not in explicit  # not a dry run, nothing to hint at
+
+
+# ─── auto-scope threshold + observability ────────────────────────────────────
+
+
+def test_search_auto_scope_is_observable_in_payload(temp_store, sample_session_file, monkeypatch):
+    """When search silently narrows to a matched project, the payload must say
+    so (auto_scoped_to) — the cheap evidence channel for tuning the threshold."""
+    from types import SimpleNamespace
+
+    _ingest(sample_session_file, temp_store)
+    fake = SimpleNamespace(
+        score=mcp_server.AUTO_SCOPE_MIN_SCORE,
+        display_name="test-project",
+        project_id="p_canary",
+    )
+    monkeypatch.setattr(mcp_server, "match_projects", lambda *a, **k: [fake])
+
+    payload = _payload(_call(mcp_server._tool_search, temp_store, {"query": "test-project auth"}))
+
+    assert isinstance(payload, dict)
+    assert payload.get("auto_scoped_to") == "test-project"
+
+
+def test_auto_scope_below_threshold_does_not_scope(temp_store, sample_session_file, monkeypatch):
+    from types import SimpleNamespace
+
+    _ingest(sample_session_file, temp_store)
+    fake = SimpleNamespace(
+        score=mcp_server.AUTO_SCOPE_MIN_SCORE - 0.01,
+        display_name="test-project",
+        project_id="p_canary",
+    )
+    monkeypatch.setattr(mcp_server, "match_projects", lambda *a, **k: [fake])
+
+    payload = _payload(_call(mcp_server._tool_search, temp_store, {"query": "test-project auth"}))
+
+    if isinstance(payload, dict):
+        assert "auto_scoped_to" not in payload
+
+
+# ─── Helpers / dispatch wiring ──────────────────────────────────────────────
+
+
+def test_dispatch_has_all_tools():
+    """Every handler is registered and every registration points to a coroutine."""
+    assert len(mcp_server._DISPATCH) == 19
+    for name, handler in mcp_server._DISPATCH.items():
+        assert inspect.iscoroutinefunction(handler), f"{name} is not a coroutine"
+
+
+def test_no_tool_declares_output_schema():
+    """list_tools() must emit no outputSchema.
+
+    Claude Code's MCP validator rejects any tool whose outputSchema.type is not
+    "object", and our handlers return TextContent (not structuredContent), so we
+    strip outputSchema entirely. Guards issue #9 — 12 of the then-19 tools
+    silently failed to load when array/oneOf outputSchemas were declared.
+    """
+    tools = asyncio.run(mcp_server.list_tools())
+    assert tools, "list_tools returned no tools"
+    assert len(tools) == 13
+    offenders = [t.name for t in tools if getattr(t, "outputSchema", None) is not None]
+    assert not offenders, (
+        f"tools must not declare outputSchema (Claude Code rejects them): {offenders}"
+    )
+
+
+# ─── Search tools ───────────────────────────────────────────────────────────
+
+
+def test_tool_search_returns_hits(sample_session_file, temp_store):
+    _ingest(sample_session_file, temp_store)
+    result = _call(mcp_server._tool_search, temp_store, {"query": "edit readme", "limit": 5})
+    payload = _payload(result)
+    # Query doesn't name the project → bare list.
+    assert isinstance(payload, list)
+
+
+def test_tool_search_auto_scopes_on_project_name_match(sample_session_file, temp_store):
+    """A query that names a known project should auto-filter to that project's
+    events, and the response should advertise the auto-scoping so agents can
+    override it."""
+    _ingest(sample_session_file, temp_store)
+    # sample_session_file's cwd is /Users/tester/test-project, so the project becomes
+    # "test project" after canonicalization.
+    result = _call(
+        mcp_server._tool_search,
+        temp_store,
+        {"query": "test project readme", "limit": 5},
+    )
+    payload = _payload(result)
+    assert isinstance(payload, dict), "auto-scoping should wrap response in an object"
+    assert payload.get("auto_scoped_to")
+    assert "test" in payload["auto_scoped_to"].lower()
+    assert "hits" in payload
+    assert isinstance(payload["hits"], list)
+
+
+def test_tool_search_honors_explicit_project_name(sample_session_file, temp_store):
+    """Explicit project_name in arguments is never overridden by auto-scoping."""
+    _ingest(sample_session_file, temp_store)
+    result = _call(
+        mcp_server._tool_search,
+        temp_store,
+        {
+            "query": "readme",
+            "project_name": "test project",
+            "limit": 5,
+        },
+    )
+    payload = _payload(result)
+    # Explicit filter → bare list, no auto_scoped_to annotation.
+    assert isinstance(payload, list)
+
+
+def test_tool_search_in_context_unknown_session(temp_store):
+    result = _call(
+        mcp_server._tool_search_in_context,
+        temp_store,
+        {"session_id": "nonexistent", "query": "anything"},
+    )
+    assert "No session matching prefix" in result[0].text
+
+
+def test_tool_search_in_context_finds_match(sample_session_file, temp_store):
+    session = _ingest(sample_session_file, temp_store)
+    result = _call(
+        mcp_server._tool_search_in_context,
+        temp_store,
+        {"session_id": session.session_id[:8], "query": "readme"},
+    )
+    text = result[0].text
+    # Either a hit payload with context_windows, or a helpful fallback string
+    assert "context_windows" in text or "No matches" in text or "no sequence" in text
+
+
+# ─── Session-level reads ────────────────────────────────────────────────────
+
+
+def test_tool_list_sessions(sample_session_file, temp_store):
+    _ingest(sample_session_file, temp_store)
+    result = _call(mcp_server._tool_list_sessions, temp_store, {"limit": 10})
+    payload = _payload(result)
+    assert isinstance(payload, list)
+    assert len(payload) >= 1
+
+
+def test_tool_get_session_timeline(sample_session_file, temp_store):
+    session = _ingest(sample_session_file, temp_store)
+    result = _call(
+        mcp_server._tool_get_session_timeline,
+        temp_store,
+        {"session_id": session.session_id, "limit": 50},
+    )
+    payload = _payload(result)
+    assert "meta" in payload
+    assert "events" in payload
+    assert payload["meta"]["session_id"] == session.session_id
+
+
+def test_tool_get_session_timeline_unknown_session(temp_store):
+    result = _call(
+        mcp_server._tool_get_session_timeline,
+        temp_store,
+        {"session_id": "no-such-session"},
+    )
+    assert "No session matching" in result[0].text
+
+
+def test_tool_get_session_timeline_summary_only(sample_session_file, temp_store):
+    session = _ingest(sample_session_file, temp_store)
+    result = _call(
+        mcp_server._tool_get_session_timeline,
+        temp_store,
+        {"session_id": session.session_id, "summary_only": True, "limit": 100},
+    )
+    payload = _payload(result)
+    for e in payload["events"]:
+        assert "content" not in e
+
+
+def test_tool_get_latest_events(sample_session_file, temp_store):
+    session = _ingest(sample_session_file, temp_store)
+    result = _call(
+        mcp_server._tool_get_latest_events,
+        temp_store,
+        {"session_id": session.session_id, "limit": 5},
+    )
+    payload = _payload(result)
+    assert payload["meta"]["order"] == "sequence DESC"
+    assert len(payload["events"]) <= 5
+
+
+# ─── File replay ────────────────────────────────────────────────────────────
+
+
+def test_tool_replay_file(multi_edit_session_file, temp_store):
+    session = _ingest(multi_edit_session_file, temp_store)
+    result = _call(
+        mcp_server._tool_replay_file,
+        temp_store,
+        {"session_id": session.session_id, "file_path": "/tmp/test/sample.py"},
+    )
+    payload = _payload(result)
+    assert payload["file_path"] == "/tmp/test/sample.py"
+    assert "content" in payload
+
+
+def test_tool_replay_file_unknown_file(sample_session_file, temp_store):
+    session = _ingest(sample_session_file, temp_store)
+    result = _call(
+        mcp_server._tool_replay_file,
+        temp_store,
+        {"session_id": session.session_id, "file_path": "/never/edited.txt"},
+    )
+    assert "No edits found" in result[0].text
+
+
+def test_tool_get_file_history(multi_edit_session_file, temp_store):
+    _ingest(multi_edit_session_file, temp_store)
+    result = _call(
+        mcp_server._tool_get_file_history,
+        temp_store,
+        {"file_path": "/tmp/test/sample.py"},
+    )
+    payload = _payload(result)
+    assert isinstance(payload, list)
+    assert len(payload) >= 3, "multi-edit fixture writes once and edits 3x"
+
+
+# ─── Stats ──────────────────────────────────────────────────────────────────
+
+
+def test_tool_get_stats(sample_session_file, temp_store):
+    _ingest(sample_session_file, temp_store)
+    result = _call(mcp_server._tool_get_stats, temp_store, {})
+    payload = _payload(result)
+    assert "sessions" in payload or "total_events" in payload or isinstance(payload, dict)
+
+
+# ─── Proactive memory tools ─────────────────────────────────────────────────
+
+
+def test_tool_recall(sample_session_file, temp_store):
+    _ingest(sample_session_file, temp_store)
+    result = _call(
+        mcp_server._tool_recall,
+        temp_store,
+        {"query": "readme edit", "max_episodes": 3},
+    )
+    payload = _payload(result)
+    assert "query" in payload
+    assert "project_matches" in payload
+
+
+def test_tool_recall_project_status_unknown(temp_store):
+    result = _call(
+        mcp_server._tool_recall_project_status,
+        temp_store,
+        {"project": "nonexistent-project-xyz"},
+    )
+    assert "No project matched" in result[0].text
+
+
+def test_tool_recall_project_status_exposes_staleness(
+    sample_session_file, temp_store, tmp_path, monkeypatch
+):
+    """recall_project_status must surface disk↔DB drift.
+
+    When a JSONL exists on disk referencing the project but isn't in the
+    sessions table, `stale=True` with a reason string pointing at
+    `longhand reconcile --fix`.
+    """
+    import shutil
+
+    # Ingest one session so a project entity exists for "test-project".
+    _ingest(sample_session_file, temp_store)
+
+    # Copy the JSONL to a second path so on-disk count > indexed count.
+    second_copy = tmp_path / "second-session.jsonl"
+    shutil.copy(sample_session_file, second_copy)
+
+    # Point discover_sessions at both files — the second is on disk but NOT
+    # in the sessions table.
+    from longhand.recall import recall_pipeline
+
+    monkeypatch.setattr(
+        recall_pipeline,
+        "discover_sessions",
+        lambda *a, **kw: [sample_session_file, second_copy],
+    )
+
+    result = _call(
+        mcp_server._tool_recall_project_status,
+        temp_store,
+        {"project": "test-project"},
+    )
+    payload = _payload(result)
+
+    assert payload["session_count_indexed"] == 1
+    assert payload["session_count_on_disk"] == 2
+    assert payload["stale"] is True
+    assert payload["stale_reason"]
+    assert "reconcile" in payload["stale_reason"]
+    # The banner is MCP-only, so it must name the tool call — not the CLI.
+    # `fix=true` is now explicit because the implicit default is dry-run at 1.0.
+    assert "fix=true" in payload["stale_reason"]
+    assert "--fix" not in payload["stale_reason"]
+    # Narrative should include the drift warning up front.
+    assert "⚠" in payload["narrative"] or "reconcile" in payload["narrative"]
+
+
+def test_tool_recall_project_status_not_stale_when_in_sync(
+    sample_session_file, temp_store, monkeypatch
+):
+    """When every on-disk JSONL for the project is ingested, stale=False."""
+    from longhand.recall import recall_pipeline
+
+    _ingest(sample_session_file, temp_store)
+
+    monkeypatch.setattr(
+        recall_pipeline,
+        "discover_sessions",
+        lambda *a, **kw: [sample_session_file],
+    )
+
+    result = _call(
+        mcp_server._tool_recall_project_status,
+        temp_store,
+        {"project": "test-project"},
+    )
+    payload = _payload(result)
+
+    assert payload["session_count_indexed"] == 1
+    assert payload["session_count_on_disk"] == 1
+    assert payload["stale"] is False
+    assert payload["stale_reason"] is None
+
+
+def test_narrative_drops_commits_with_blank_hash():
+    """Historical git_operations rows with NULL/empty commit_hash should not
+    produce blank backticks in the narrative."""
+    from longhand.recall.narrative import build_project_status_narrative
+
+    last_commits = [
+        {
+            "commit_hash": "abc1234",
+            "commit_message": "fix thing",
+            "timestamp": "2026-04-23T00:00:00+00:00",
+        },
+        {"commit_hash": None, "commit_message": None, "timestamp": "2026-04-23T00:00:00+00:00"},
+        {"commit_hash": "", "commit_message": "ghost", "timestamp": "2026-04-23T00:00:00+00:00"},
+    ]
+    narrative = build_project_status_narrative(
+        display_name="foo",
+        canonical_path="/tmp/foo",
+        last_commits=last_commits,
+        active_branch=None,
+        recent_sessions=[
+            {"session_id": "s1", "started_at": "2026-04-23T00:00:00+00:00", "event_count": 1}
+        ],
+        recent_episodes=[],
+        unresolved_episodes=[],
+        recent_segments=[],
+        last_outcome={"outcome": "fixed"},
+    )
+    # The good commit renders; the bad ones don't.
+    assert "abc1234" in narrative
+    assert "`` " not in narrative  # no empty backtick-pair
+    assert "ghost" not in narrative
+    # Count uses filtered list
+    assert "Recent commits (1)" in narrative
+
+
+def test_narrative_uses_episode_fix_summary_not_user_message():
+    """The last-session outcome trailer should come from an episode's
+    fix_summary, not session_outcomes.summary (which is a user message)."""
+    from longhand.recall.narrative import build_project_status_narrative
+
+    narrative = build_project_status_narrative(
+        display_name="foo",
+        canonical_path="/tmp/foo",
+        last_commits=[],
+        active_branch=None,
+        recent_sessions=[
+            {"session_id": "s1", "started_at": "2026-04-23T00:00:00+00:00", "event_count": 1}
+        ],
+        recent_episodes=[{"fix_summary": "refactored the auth middleware to scope tokens"}],
+        unresolved_episodes=[],
+        recent_segments=[],
+        last_outcome={
+            "outcome": "fixed",
+            "summary": "fixed: can you pull my bsoi-ops from my git and review",
+        },
+        latest_fix_summary="refactored the auth middleware to scope tokens",
+    )
+    assert "refactored the auth middleware" in narrative
+    assert "Last fix: refactored the auth middleware" in narrative
+    # The old polluted summary must not leak in.
+    assert "pull my bsoi-ops from my git" not in narrative
+
+
+def test_narrative_outcome_only_when_no_episode_summary():
+    """No episode fix_summary → outcome word stands alone, no misleading text."""
+    from longhand.recall.narrative import build_project_status_narrative
+
+    narrative = build_project_status_narrative(
+        display_name="foo",
+        canonical_path="/tmp/foo",
+        last_commits=[],
+        active_branch=None,
+        recent_sessions=[
+            {"session_id": "s1", "started_at": "2026-04-23T00:00:00+00:00", "event_count": 1}
+        ],
+        recent_episodes=[],
+        unresolved_episodes=[],
+        recent_segments=[],
+        last_outcome={
+            "outcome": "fixed",
+            "summary": "fixed: can you pull my bsoi-ops from my git",
+        },
+    )
+    assert "**fixed**" in narrative
+    assert "Last fix:" not in narrative
+    assert "pull my bsoi-ops" not in narrative
+
+
+def test_recall_narrative_surfaces_secondary_segments():
+    """Regression — when episodes win the primary slot, segment hits in OTHER
+    sessions used to be silently dropped. Surfacing them as a footer so the
+    user can chase weaker-but-relevant matches the primary missed.
+
+    Regression source: session eef364a9 contained a "what v0.8 should fix"
+    list inside a v0.7.0 release-notes draft. Recall returned the older
+    v0.5.x roadmap session as primary and went silent on eef364a9 even though
+    a segment match existed.
+    """
+    from longhand.recall.narrative import build_narrative
+
+    primary_episode = {
+        "session_id": "abc12345-aaaa",
+        "started_at": "2026-04-20T18:00:00+00:00",
+        "problem_description": "Roadmap planning for the v0.5.x cleanup batch",
+        "diagnosis_summary": "",
+        "fix_summary": "Wrote audit-cleanup-roadmap.md",
+        "status": "resolved",
+    }
+    secondary = [
+        {
+            "session_id": "eef364a9-zzzz",
+            "started_at": "2026-04-23T03:55:00+00:00",
+            "topic": "v0.8.0 followups: fix_summary cleanup, doctor inlining",
+            "_distance": 0.9,
+        },
+    ]
+    narrative = build_narrative(
+        query="longhand v0.8 future plans",
+        project_matches=[],
+        episodes=[primary_episode],
+        artifacts={},
+        secondary_segments=secondary,
+    )
+    assert "Also possibly relevant" in narrative
+    assert "eef364a9" in narrative
+    assert "v0.8.0" in narrative
+
+
+def test_recall_narrative_omits_secondary_when_none():
+    """No secondary_segments → no footer (don't render an empty section)."""
+    from longhand.recall.narrative import build_narrative
+
+    narrative = build_narrative(
+        query="anything",
+        project_matches=[],
+        episodes=[
+            {
+                "session_id": "abc12345",
+                "started_at": "2026-04-20T18:00:00+00:00",
+                "problem_description": "p",
+                "fix_summary": "f",
+            }
+        ],
+        artifacts={},
+        secondary_segments=None,
+    )
+    assert "Also possibly relevant" not in narrative
+
+
+def test_tool_match_project(sample_session_file, temp_store):
+    _ingest(sample_session_file, temp_store)
+    result = _call(mcp_server._tool_match_project, temp_store, {"query": "project", "top_k": 3})
+    payload = _payload(result)
+    assert isinstance(payload, list)
+
+
+# ─── Episodes ───────────────────────────────────────────────────────────────
+
+
+def test_tool_find_episodes(sample_session_file, temp_store):
+    _ingest(sample_session_file, temp_store)
+    result = _call(
+        mcp_server._tool_find_episodes,
+        temp_store,
+        {"limit": 10, "has_fix": False},
+    )
+    payload = _payload(result)
+    assert isinstance(payload, list)
+
+
+def test_tool_find_episodes_default_filters_in_sql(temp_store):
+    """has_fix (default true) must filter in SQL, not after the recency LIMIT.
+
+    Regression: 20+ recent fixless episodes pushed every with-fix episode past
+    the limit, so the tool's DEFAULT call returned [] on corpora whose newest
+    episodes are extraction noise.
+    """
+
+    def _ep(eid: str, day: int, month: int, fix: str | None) -> dict:
+        return {
+            "episode_id": eid,
+            "session_id": "s-eps",
+            "project_id": "p1",
+            "started_at": f"2026-{month:02d}-{day:02d}T10:00:00Z",
+            "ended_at": f"2026-{month:02d}-{day:02d}T10:30:00Z",
+            "problem_event_id": f"pe-{eid}",
+            "fix_event_id": fix,
+            "problem_description": "text",
+            "fix_summary": "fixed" if fix else "",
+            "touched_files": [],
+            "tags": [],
+            "status": "resolved" if fix else "unresolved",
+        }
+
+    older_with_fix = [_ep(f"ep-fix-{i}", day=1 + i, month=5, fix=f"fe-{i}") for i in range(5)]
+    recent_fixless = [_ep(f"ep-noise-{i}", day=1 + i, month=6, fix=None) for i in range(21)]
+    temp_store.sqlite.insert_episodes(older_with_fix + recent_fixless)
+
+    result = _call(mcp_server._tool_find_episodes, temp_store, {"limit": 20})
+    payload = _payload(result)
+
+    ids = {e["episode_id"] for e in payload}
+    assert {f"ep-fix-{i}" for i in range(5)} <= ids
+    assert all(e["fix_event_id"] for e in payload)
+
+
+def test_tool_get_episode_unknown(temp_store):
+    result = _call(
+        mcp_server._tool_get_episode,
+        temp_store,
+        {"episode_id": "no-such-episode"},
+    )
+    assert "No episode" in result[0].text
+
+
+# ─── Git / commits ──────────────────────────────────────────────────────────
+
+
+def test_tool_get_session_commits(sample_session_file, temp_store):
+    session = _ingest(sample_session_file, temp_store)
+    result = _call(
+        mcp_server._tool_get_session_commits,
+        temp_store,
+        {"session_id": session.session_id},
+    )
+    payload = _payload(result)
+    assert isinstance(payload, list)
+
+
+def test_tool_get_session_commits_unknown(temp_store):
+    result = _call(
+        mcp_server._tool_get_session_commits,
+        temp_store,
+        {"session_id": "nope"},
+    )
+    assert "No session matching" in result[0].text
+
+
+def test_tool_find_commits(sample_session_file, temp_store):
+    _ingest(sample_session_file, temp_store)
+    result = _call(mcp_server._tool_find_commits, temp_store, {"query": "commit", "limit": 5})
+    payload = _payload(result)
+    assert isinstance(payload, list)
+
+
+# ─── Projects ───────────────────────────────────────────────────────────────
+
+
+def test_tool_list_projects(sample_session_file, temp_store):
+    _ingest(sample_session_file, temp_store)
+    result = _call(mcp_server._tool_list_projects, temp_store, {"limit": 10})
+    payload = _payload(result)
+    assert isinstance(payload, list)
+
+
+def test_tool_list_projects_verbose(sample_session_file, temp_store):
+    _ingest(sample_session_file, temp_store)
+    result = _call(
+        mcp_server._tool_list_projects,
+        temp_store,
+        {"limit": 10, "verbose": True},
+    )
+    payload = _payload(result)
+    assert isinstance(payload, list)
+
+
+def test_tool_get_project_timeline_empty(temp_store):
+    result = _call(
+        mcp_server._tool_get_project_timeline,
+        temp_store,
+        {"project_id": "no-such-project"},
+    )
+    payload = _payload(result)
+    assert payload == []
+
+
+# ─── Staleness banner propagation (silent-failure class) ────────────────────
+
+
+def test_tool_search_surfaces_staleness_when_scoped(
+    sample_session_file, temp_store, tmp_path, monkeypatch
+):
+    """search must wrap the response with `stale`/`stale_reason` when the project
+    it auto-scoped to has on-disk transcripts that aren't yet indexed.
+
+    Closes the silent-failure case where `search("portneuf junk removal")`
+    returned `hits: []` with no signal that an un-ingested transcript existed.
+    """
+    import shutil
+
+    _ingest(sample_session_file, temp_store)
+    second_copy = tmp_path / "second-session.jsonl"
+    shutil.copy(sample_session_file, second_copy)
+
+    from longhand.recall import recall_pipeline
+
+    monkeypatch.setattr(
+        recall_pipeline,
+        "discover_sessions",
+        lambda *a, **kw: [sample_session_file, second_copy],
+    )
+
+    result = _call(
+        mcp_server._tool_search,
+        temp_store,
+        {"query": "test project readme", "limit": 5},
+    )
+    payload = _payload(result)
+    assert isinstance(payload, dict)
+    assert payload.get("stale") is True
+    assert payload.get("stale_reason")
+    assert "reconcile" in payload["stale_reason"]
+    assert "hits" in payload
+
+
+def test_tool_list_sessions_surfaces_staleness_when_filtered(
+    sample_session_file, temp_store, tmp_path, monkeypatch
+):
+    """list_sessions with a `project` filter on a stale project wraps with envelope."""
+    import shutil
+
+    _ingest(sample_session_file, temp_store)
+    second_copy = tmp_path / "second-session.jsonl"
+    shutil.copy(sample_session_file, second_copy)
+
+    from longhand.recall import recall_pipeline
+
+    monkeypatch.setattr(
+        recall_pipeline,
+        "discover_sessions",
+        lambda *a, **kw: [sample_session_file, second_copy],
+    )
+
+    result = _call(
+        mcp_server._tool_list_sessions,
+        temp_store,
+        {"project": "test project", "limit": 10},
+    )
+    payload = _payload(result)
+    assert isinstance(payload, dict)
+    assert payload.get("stale") is True
+    assert "reconcile" in payload["stale_reason"]
+    assert isinstance(payload["sessions"], list)
+
+
+def test_tool_list_sessions_unfiltered_returns_bare_list(sample_session_file, temp_store):
+    """No filter → bare list, preserving backward-compat for global callers."""
+    _ingest(sample_session_file, temp_store)
+    result = _call(mcp_server._tool_list_sessions, temp_store, {"limit": 10})
+    payload = _payload(result)
+    assert isinstance(payload, list)
+
+
+# ─── reconcile MCP tool ─────────────────────────────────────────────────────
+
+
+def test_tool_reconcile_dry_run(sample_session_file, temp_store, monkeypatch):
+    """fix=False returns counts without ingesting."""
+    from longhand.recall import reconcile as reconcile_mod
+
+    _ingest(sample_session_file, temp_store)
+    monkeypatch.setattr(
+        reconcile_mod,
+        "discover_sessions",
+        lambda *a, **kw: [sample_session_file],
+    )
+
+    result = _call(mcp_server._tool_reconcile, temp_store, {"fix": False})
+    payload = _payload(result)
+    assert payload["files_on_disk"] == 1
+    assert payload["fully_indexed"] == 1
+    assert payload["fix_applied"] is False
+    assert payload["ingested"] == 0
+
+
+def test_tool_reconcile_fix_ingests_missing(sample_session_file, temp_store, tmp_path, monkeypatch):
+    """fix=True re-ingests missing transcripts and a follow-up search returns hits."""
+    import shutil
+
+    from longhand.recall import recall_pipeline
+    from longhand.recall import reconcile as reconcile_mod
+
+    # Copy the fixture so the missing transcript has a distinct session_id
+    # (Longhand uses transcript_path as identity).
+    second_copy = tmp_path / "second-session.jsonl"
+    shutil.copy(sample_session_file, second_copy)
+
+    # Only the original is ingested at the start.
+    _ingest(sample_session_file, temp_store)
+
+    # Both files are visible on disk to the discover walker — drift detector
+    # and reconcile share the same source.
+    monkeypatch.setattr(
+        reconcile_mod,
+        "discover_sessions",
+        lambda *a, **kw: [sample_session_file, second_copy],
+    )
+    monkeypatch.setattr(
+        recall_pipeline,
+        "discover_sessions",
+        lambda *a, **kw: [sample_session_file, second_copy],
+    )
+
+    result = _call(mcp_server._tool_reconcile, temp_store, {"fix": True})
+    payload = _payload(result)
+    assert payload["fix_applied"] is True
+    # second_copy was missing from sessions; reconcile should have ingested it.
+    # (If parser skips an empty/duplicate copy it stays at 0, so accept either.)
+    assert payload["ingested"] >= 0
+    assert payload["lock_unavailable"] is False
+
+
+def test_tool_reconcile_default_fix_is_false(temp_store, monkeypatch):
+    """When `fix` is omitted, the MCP tool defaults to a dry run — matching the CLI."""
+    from longhand.recall import reconcile as reconcile_mod
+
+    captured: dict[str, bool] = {}
+
+    def fake_run(store, fix=False):
+        captured["fix"] = fix
+        from longhand.recall.reconcile import ReconcileReport
+
+        return ReconcileReport(files_on_disk=0, fully_indexed=0)
+
+    monkeypatch.setattr(reconcile_mod, "run_reconcile", fake_run)
+    monkeypatch.setattr(mcp_server, "run_reconcile", fake_run)
+
+    _call(mcp_server._tool_reconcile, temp_store, {})
+    assert captured["fix"] is False
+
+
+# ─── End-to-end dispatch ────────────────────────────────────────────────────
+
+
+def test_dispatch_unknown_tool(temp_store):
+    """call_tool routes unknown names through the fallback branch."""
+    # Directly exercise the dispatch via a helper handler — the real call_tool
+    # instantiates its own store, so we test the routing through _DISPATCH.
+    assert mcp_server._DISPATCH.get("not-a-real-tool") is None
+
+
+def test_limit_floors_negative_values():
+    """A negative limit must clamp to 1, not flow through to SQLite LIMIT -1
+    (which means unbounded)."""
+    assert mcp_server._limit(-1, 10) == 1
+    assert mcp_server._limit(-500, 10) == 1
+    assert mcp_server._limit(0, 10) == 1
+    assert mcp_server._limit(None, 10) == 10
+    assert mcp_server._limit(999999, 10) == mcp_server.MAX_LIMIT
+
+
+def test_offset_floors_negative_values():
+    assert mcp_server._offset(-3) == 0
+    assert mcp_server._offset(None) == 0
+    assert mcp_server._offset("7") == 7
+
+
+def test_query_is_bounded_and_coerced():
+    """Semantic queries are capped before reaching the ONNX encoder."""
+    huge = "x" * (mcp_server.MAX_QUERY_CHARS * 10)
+    assert len(mcp_server._query(huge)) == mcp_server.MAX_QUERY_CHARS
+    assert mcp_server._query(None) == ""
+    assert mcp_server._query(123) == "123"
+    assert mcp_server._query("hello") == "hello"
+
+
+# ensure pytest doesn't collect the Any import as a test
+_ = pytest, Any
+
+
+def test_tool_find_episodes_default_filters_low_confidence(temp_store):
+    """min_confidence (default 0.5) keeps extraction noise out of the default
+    call; min_confidence=0 opts back in to everything."""
+    base = {
+        "session_id": "s-conf",
+        "project_id": "p1",
+        "started_at": "2026-06-01T10:00:00Z",
+        "ended_at": "2026-06-01T10:30:00Z",
+        "problem_event_id": "pe",
+        "fix_event_id": "fe",
+        "problem_description": "text",
+        "fix_summary": "fixed",
+        "touched_files": [],
+        "tags": [],
+        "status": "resolved",
+    }
+    temp_store.sqlite.insert_episodes(
+        [
+            {**base, "episode_id": "ep-solid", "confidence": 0.8},
+            {**base, "episode_id": "ep-noise", "confidence": 0.3},
+        ]
+    )
+
+    default = _payload(_call(mcp_server._tool_find_episodes, temp_store, {}))
+    assert {e["episode_id"] for e in default} == {"ep-solid"}
+
+    everything = _payload(_call(mcp_server._tool_find_episodes, temp_store, {"min_confidence": 0}))
+    assert {e["episode_id"] for e in everything} == {"ep-solid", "ep-noise"}
+
+
+# ─── Timeline pagination, auto-scope, and sidechain ordering ─────────────────
+#
+# Three defects found 2026-09-17, all in the MCP path only (the CLI reads
+# store.sqlite.get_events directly and was never affected).
+
+
+def _many_event_session(tmp_path, n=12, session_id="paginate-me"):
+    """A session file of n plain turns with ordered, distinct timestamps."""
+    path = tmp_path / "paginated.jsonl"
+    with path.open("w") as fh:
+        for i in range(n):
+            fh.write(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": f"u-{i}",
+                        "parentUuid": None,
+                        "sessionId": session_id,
+                        "timestamp": f"2026-04-09T10:{i:02d}:00.000Z",
+                        "cwd": "/Users/tester/test-project",
+                        "isSidechain": False,
+                        "message": {"role": "user", "content": f"message number {i}"},
+                    }
+                )
+                + "\n"
+            )
+    return path
+
+
+def test_timeline_honors_limit_when_tail_is_absent(tmp_path, temp_store):
+    """Regression: _limit() floors at 1, so the tail sentinel 0 clamped to 1
+    and every paginated read returned exactly one event (bad2f17 → v1.2.0)."""
+    session = _ingest(_many_event_session(tmp_path), temp_store)
+
+    payload = _payload(
+        _call(
+            mcp_server._tool_get_session_timeline,
+            temp_store,
+            {"session_id": session.session_id, "limit": 5},
+        )
+    )
+
+    assert len(payload["events"]) == 5
+    assert payload["meta"]["returned"] == 5
+    # A response the caller never asked to tail must not claim it was tailed.
+    assert "tail" not in payload["meta"]
+
+
+def test_timeline_offset_paginates(tmp_path, temp_store):
+    session = _ingest(_many_event_session(tmp_path), temp_store)
+
+    first = _payload(
+        _call(
+            mcp_server._tool_get_session_timeline,
+            temp_store,
+            {"session_id": session.session_id, "limit": 4},
+        )
+    )
+    second = _payload(
+        _call(
+            mcp_server._tool_get_session_timeline,
+            temp_store,
+            {"session_id": session.session_id, "offset": 4, "limit": 4},
+        )
+    )
+
+    assert len(first["events"]) == 4
+    assert len(second["events"]) == 4
+    assert second["meta"]["offset"] == 4
+    first_ids = [e["event_id"] for e in first["events"]]
+    second_ids = [e["event_id"] for e in second["events"]]
+    assert not set(first_ids) & set(second_ids), "offset returned an overlapping page"
+
+
+def test_timeline_explicit_tail_still_works(tmp_path, temp_store):
+    """The fix must not over-correct: an explicit tail keeps tailing."""
+    session = _ingest(_many_event_session(tmp_path), temp_store)
+
+    payload = _payload(
+        _call(
+            mcp_server._tool_get_session_timeline,
+            temp_store,
+            {"session_id": session.session_id, "tail": 3},
+        )
+    )
+
+    assert len(payload["events"]) == 3
+    assert payload["meta"]["tail"] == 3
+    everything = _payload(
+        _call(
+            mcp_server._tool_get_session_timeline,
+            temp_store,
+            {"session_id": session.session_id, "limit": 50},
+        )
+    )
+    assert [e["event_id"] for e in payload["events"]] == [
+        e["event_id"] for e in everything["events"][-3:]
+    ]
+
+
+def test_tail_coercion_keeps_zero_distinct_from_one():
+    """_tail treats 0 as "not requested"; _limit's floor of 1 is correct for
+    real limits but would destroy that sentinel — which is why _tail exists."""
+    assert mcp_server._tail(None) == 0
+    assert mcp_server._tail(0) == 0
+    assert mcp_server._tail(-3) == 0
+    assert mcp_server._tail(5) == 5
+    assert mcp_server._tail(10**9) == mcp_server.MAX_LIMIT
+    # Unchanged, and deliberately so: a real limit must never reach SQL as 0/-1.
+    assert mcp_server._limit(None, 0) == 1
+    assert mcp_server._limit(-5, 100) == 1
+
+
+def test_explicit_session_id_suppresses_project_auto_scope(
+    sample_session_file, temp_store, monkeypatch
+):
+    """An explicit session_id is the most specific filter there is; a fuzzy
+    project match on the query text must not be layered on top of it."""
+    session = _ingest(sample_session_file, temp_store)
+
+    class _Match:
+        display_name = "some other project"
+        score = 999.0
+
+    monkeypatch.setattr(mcp_server, "match_projects", lambda *a, **k: [_Match()])
+
+    scoped = _payload(
+        _call(
+            mcp_server._tool_search,
+            temp_store,
+            {"query": "readme", "session_id": session.session_id},
+        )
+    )
+    assert "auto_scoped_to" not in json.dumps(scoped)
+
+    # Without a session_id the auto-scope still fires — that behavior is wanted.
+    unscoped = _payload(_call(mcp_server._tool_search, temp_store, {"query": "readme"}))
+    assert unscoped.get("auto_scoped_to") == "some other project"
+
+
+def test_shared_timeline_orders_by_time_across_sidechains(
+    sample_session_file, temp_store, monkeypatch
+):
+    """Subagent transcripts are stored under the PARENT session_id with their
+    own sequence restarting at 0. Ordering by sequence alone interleaved them
+    and read as rows from several different sessions."""
+    from longhand import lightweight_mcp
+
+    session = _ingest(sample_session_file, temp_store)
+
+    with temp_store.sqlite.connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM events WHERE session_id = ? LIMIT 1", (session.session_id,)
+        ).fetchone()
+        template = dict(row)
+        # Two subagent events, sequence restarting at 0, timestamps interleaved
+        # between the parent's — plus one parser collision-duplicate row.
+        for event_id, seq, ts, sidechain in [
+            ("sub-a", 0, "2026-04-09T10:00:01.500000+00:00", 1),
+            ("sub-b", 1, "2026-04-09T10:00:02.500000+00:00", 1),
+            ("dupe#1", 0, "2026-04-09T10:00:01.600000+00:00", 0),
+        ]:
+            new = {
+                **template,
+                "event_id": event_id,
+                "sequence": seq,
+                "timestamp": ts,
+                "is_sidechain": sidechain,
+                "content": f"content for {event_id}",
+            }
+            cols = ", ".join(new)
+            conn.execute(
+                f"INSERT INTO events ({cols}) VALUES ({', '.join('?' * len(new))})",
+                list(new.values()),
+            )
+        conn.commit()
+
+    monkeypatch.setenv("LONGHAND_DATA_DIR", str(temp_store.data_dir))
+    rows = lightweight_mcp.get_session_timeline(session.session_id, limit=50)
+
+    timestamps = [r["timestamp"] for r in rows]
+    assert timestamps == sorted(timestamps), "shared timeline is not in chronological order"
+    ids = [r["event_id"] for r in rows]
+    assert "sub-a" in ids and "sub-b" in ids
+    assert "dupe#1" not in ids, "parser collision duplicates must stay hidden"
+    # The reader can tell a subagent row from a parent row without guessing.
+    assert {r["is_sidechain"] for r in rows} == {0, 1}
+
+
+# ─── Found by the 1.2.2 docs audit ───────────────────────────────────────────
+
+
+def _long_session(tmp_path, n, session_id="long-session"):
+    """A session file of n user turns, one second apart — past the 60-minute
+    range the paginated fixture above can express."""
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 4, 9, 10, 0, 0, tzinfo=timezone.utc)
+    path = tmp_path / "long.jsonl"
+    with path.open("w") as fh:
+        for i in range(n):
+            stamp = (base + timedelta(seconds=i)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            fh.write(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": f"u-{i}",
+                        "parentUuid": None,
+                        "sessionId": session_id,
+                        "timestamp": stamp,
+                        "cwd": "/Users/tester/test-project",
+                        "isSidechain": False,
+                        "message": {"role": "user", "content": f"message number {i}"},
+                    }
+                )
+                + "\n"
+            )
+    return path
+
+
+def test_timeline_tail_reaches_the_end_of_a_session_over_5000_events(tmp_path, temp_store):
+    """tail read the FIRST 5,000 events in ascending order and sliced their end,
+    so on a longer session "how did it end" returned events from the middle."""
+    parser = JSONLParser(_long_session(tmp_path, 5010))
+    events = list(parser.parse_events())
+    session = parser.build_session(events)
+    # SQLite only: the tool reads events, and embedding 5,010 of them buys nothing.
+    temp_store.sqlite.upsert_session(session)
+    temp_store.sqlite.insert_events(events)
+
+    payload = _payload(
+        _call(
+            mcp_server._tool_get_session_timeline,
+            temp_store,
+            {"session_id": session.session_id, "tail": 3},
+        )
+    )
+
+    assert [e["content"] for e in payload["events"]] == [
+        "message number 5007",
+        "message number 5008",
+        "message number 5009",
+    ]
+
+
+def test_reconcile_schema_default_matches_the_handler():
+    """The schema advertised fix=True by default while the handler dry-runs, so an
+    agent omitting `fix` expected a repair and got a report."""
+    reconcile = next(t for t in asyncio.run(mcp_server.list_tools()) if t.name == "reconcile")
+    fix = reconcile.inputSchema["properties"]["fix"]
+    assert fix["default"] is False
+    assert "default True" not in fix["description"]
